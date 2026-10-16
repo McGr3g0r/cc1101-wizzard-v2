@@ -8,7 +8,7 @@
 // Firmware / device identity (reported by the 'info' CLI command)
 #define FW_NAME     "cc1101-wizzard"
 #define FW_VARIANT  "v2"
-#define FW_BUILD_NO 1          // bump on each release build
+#define FW_BUILD_NO 2          // bump on each release build
 #define CLI_API_VER 1          // CLI protocol version for host negotiation
 //------------------------------------------------------------------------------------------------------------------
 //RP2040 pins SPI0

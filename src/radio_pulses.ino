@@ -87,39 +87,73 @@ int radio_pulses_grab(Stream& input, int startOffset, int minPulseUs, int maxSpa
 // Pure GPIO pulse capture: NO radio reconfiguration, NO RadioLib calls. The
 // caller must have already put the radio into async direct RX (data on gdo0).
 // Hard-capped in time so RF noise can never spin this forever.
+//
+// Frame-boundary ("gap -> frame -> gap") triggering so one capture is exactly
+// one complete, aligned frame regardless of when it started:
+//   1) wait for an idle period (continuous LOW >= maxSpaceUs) -> we are in the
+//      inter-frame gap, not mid-frame;
+//   2) start on the first rising edge -> the real frame start (preamble);
+//   3) record edge intervals until the next long LOW gap (>= maxSpaceUs) ends
+//      the frame;
+//   4) trim leading/trailing runts (edge glitches shorter than minPulseUs).
+// maxSpaceUs is the guard/inter-frame gap threshold (set it just above the
+// longest intra-frame LOW, e.g. ~10-30x the bit period for a keyfob).
 int radio_pulses_capture(int startOffset, int minPulseUs, int maxSpaceUs)
 {
-    int idx = startOffset;
-    uint32_t s2;
-    int tdiff;
-
     pinMode(gdo0, INPUT);
 
-    uint32_t grabStart = micros();
-    uint32_t s = micros();
-    while (digitalRead(gdo0) == LOW && micros() - s < maxSpaceUs);
-    if (micros() - s < maxSpaceUs)
+    const uint32_t guardUs    = (uint32_t)maxSpaceUs;
+    const uint32_t deadlineUs = (uint32_t)RADIO_PULSES_MAX_GRAB_US;
+    const uint32_t grabStart  = micros();
+
+    // Phase 1: wait for an idle period (continuous LOW >= guardUs). Any HIGH
+    // restarts the idle timer, so we only pass once we are between frames.
+    uint32_t idleStart = micros();
+    for (;;)
     {
-       idx = startOffset;
-       uint8_t curr_val = 1;
-       s = micros();
-       while ((idx < radio_pulses_buffer_len) && (micros() - s < maxSpaceUs) && (micros() - grabStart < RADIO_PULSES_MAX_GRAB_US))
-       {
-            while ((digitalRead(gdo0) == curr_val) && (micros() - s < maxSpaceUs) && (micros() - grabStart < RADIO_PULSES_MAX_GRAB_US));
-            s2 = micros();
-            tdiff = s2 - s;
-            if (tdiff < maxSpaceUs)
-            {
-               if (tdiff >= minPulseUs)
-                   radio_pulses_buffer[idx++] = tdiff;
-               s = micros();
-               curr_val++;
-               curr_val &= 0x01;
-            }
-       }
-       radio_pulses_cnt = idx;
+        if ((uint32_t)(micros() - grabStart) >= deadlineUs) { radio_pulses_cnt = startOffset; return 0; }
+        if (digitalRead(gdo0) != LOW) idleStart = micros();
+        else if ((uint32_t)(micros() - idleStart) >= guardUs) break;
     }
-    return idx - startOffset;
+
+    // Phase 2: wait for the first rising edge = clean frame start.
+    while (digitalRead(gdo0) == LOW)
+        if ((uint32_t)(micros() - grabStart) >= deadlineUs) { radio_pulses_cnt = startOffset; return 0; }
+
+    // Phase 3: record edge intervals until the next long LOW gap (frame end).
+    int idx = startOffset;
+    uint8_t curr_val = 1;          // line is HIGH now (we just saw the rising edge)
+    uint32_t s = micros();
+    while (idx < radio_pulses_buffer_len)
+    {
+        while (digitalRead(gdo0) == curr_val)
+        {
+            if ((uint32_t)(micros() - s) >= guardUs) break;
+            if ((uint32_t)(micros() - grabStart) >= deadlineUs) break;
+        }
+        uint32_t now   = micros();
+        uint32_t tdiff = now - s;
+
+        if (curr_val == 0 && tdiff >= guardUs) break;                     // guard on LOW -> frame end
+        if ((uint32_t)(micros() - grabStart) >= deadlineUs) break;        // overall time cap
+
+        radio_pulses_buffer[idx++] = (tdiff > 0xFFFF) ? 0xFFFF : (uint16_t)tdiff;
+        s = now;
+        curr_val ^= 0x01;
+    }
+
+    // Phase 4: trim leading/trailing runts (edge glitches < minPulseUs).
+    int begin = startOffset;
+    int end   = idx;                                   // exclusive
+    while (end > begin && radio_pulses_buffer[begin]     < (uint16_t)minPulseUs) begin++;
+    while (end > begin && radio_pulses_buffer[end - 1]   < (uint16_t)minPulseUs) end--;
+
+    int outN = end - begin;
+    if (begin != startOffset && outN > 0)
+        memmove(&radio_pulses_buffer[startOffset], &radio_pulses_buffer[begin], (size_t)outN * sizeof(uint16_t));
+
+    radio_pulses_cnt = startOffset + outN;
+    return outN;
 }
 //------------------------------------------------------------------------------------------------------------------
 int radio_pulses_send(int startOffset, int pulses)
