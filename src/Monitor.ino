@@ -43,9 +43,14 @@ void radio_profile_exec_line(void* ctx, const char* line);  // defined in radio_
 #define MON_FMT_JSON 0
 #define MON_FMT_HEX  1
 #define MOD_OOK      2
-#define MON_OOK_MIN_PULSES 8          // ignore shorter noise bursts
-#define MON_OOK_MAX_PULSES 1024       // above this it's just noise filling the buffer -> skip
-                                      // (also caps emit size so a noise frame can't block serial for ~1s)
+// No MIN/MAX pulse-count filter here by design: the receiver is low-level and
+// has no notion of what a "real" frame looks like for any given remote, so it
+// does not guess which captures are noise - it reports every capture it makes
+// (n > 0) and leaves filtering/interpretation entirely to the host. A capture
+// can be as short as 1 pulse or as long as the buffer allows (see
+// radio_pulses_buffer_len, currently RADIO_BUFFER_MAIN/2 pulses); a very long
+// one takes proportionally longer to print over serial, which is the direct,
+// visible cost of not dropping data silently.
 #define MON_OOK_DEF_MINUS  100
 #define MON_OOK_DEF_MAXGAP 15000
 #define MON_OOK_RSSI_GATE  -85       // dBm: only capture when RSSI is above this (carrier present)
@@ -306,7 +311,7 @@ void monitor_poll(void)
          int n = mon_cap_count;
          mon_cap_done = false;
          lastCapMs = millis();
-         if (n >= MON_OOK_MIN_PULSES && n <= MON_OOK_MAX_PULSES)
+         if (n > 0)   // report every capture made; n==0 means grab() timed out before any edge arrived
             monitor_emit_pulses(r, radio_pulses_get_pulses(), n);   // emit the WHOLE frame (no truncation)
          return;
       }

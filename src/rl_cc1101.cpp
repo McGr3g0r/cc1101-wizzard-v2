@@ -22,6 +22,7 @@ static RLCC1101* s_radio  = nullptr;   // RadioLib's CC1101 (not the firmware's 
 static bool     s_ok     = false;
 static int      s_beginSt = 0;         // RadioLib begin() return code (diagnostic)
 static volatile bool s_rxFlag = false;
+static float    s_freqMhz = 433.92f;   // last frequency set; picks the PA band table
 //------------------------------------------------------------------------------------------------------------------
 static void rl_isr(void) { s_rxFlag = true; }
 //------------------------------------------------------------------------------------------------------------------
@@ -40,6 +41,7 @@ bool rl_begin(int csPin, int gdo0Pin, int gdo2Pin,
       s_mod   = new Module((uint32_t)csPin, (uint32_t)gdo0Pin, RADIOLIB_NC, (uint32_t)gdo2Pin, SPI);
       s_radio = new RLCC1101(s_mod);
    }
+   s_freqMhz = freqMhz;
    s_beginSt = s_radio->begin(freqMhz, brKbps, devKhz, rxbwKhz, (int8_t)pwrDbm, (uint8_t)preambleBits);
    // "present" means a CC1101 actually answered on SPI with a valid chip
    // version. begin() can still return a non-fatal error from one of its
@@ -82,7 +84,118 @@ int rl_set_ook_patable(int powerByte)
    return t[1];
 }
 //------------------------------------------------------------------------------------------------------------------
-void rl_set_freq_mhz(float mhz)     { if (s_radio) s_radio->setFrequency(mhz); }
+// TI/ELECHOUSE recommended PATABLE power bytes, per band. Index order matches
+// the dBm breakpoints used in rl_power_byte_for_dbm() below. These are the same
+// values the old ELECHOUSE build used, so OOK output level is preserved.
+//                              -30   -20   -15   -10    0     5     7    >7
+static const uint8_t PA_315[8] = {0x12,0x0D,0x1C,0x34,0x51,0x85,0xCB,0xC2};
+static const uint8_t PA_433[8] = {0x12,0x0E,0x1D,0x34,0x60,0x84,0xC8,0xC0};
+//                              -30   -20   -15   -10   -6    0     5     7    10   >10
+static const uint8_t PA_868[10]= {0x03,0x17,0x1D,0x26,0x37,0x50,0x86,0xCD,0xC5,0xC0};
+static const uint8_t PA_915[10]= {0x03,0x0E,0x1E,0x27,0x38,0x8E,0x84,0xCC,0xC3,0xC0};
+//------------------------------------------------------------------------------------------------------------------
+uint8_t rl_power_byte_for_dbm(int dbm)
+{
+   float f = s_freqMhz;
+   // 300-348 and 387-464 MHz bands: 8-entry tables, coarse steps
+   if (f <= 348.0f || (f >= 378.0f && f <= 464.0f))
+   {
+      const uint8_t* t = (f <= 348.0f) ? PA_315 : PA_433;
+      int i;
+      if      (dbm <= -30) i = 0;
+      else if (dbm <= -20) i = 1;
+      else if (dbm <= -15) i = 2;
+      else if (dbm <= -10) i = 3;
+      else if (dbm <=   0) i = 4;
+      else if (dbm <=   5) i = 5;
+      else if (dbm <=   7) i = 6;
+      else                 i = 7;
+      return t[i];
+   }
+   // 779-928 MHz: 10-entry tables, finer steps (split 868 vs 915 at 900 MHz)
+   const uint8_t* t = (f < 900.0f) ? PA_868 : PA_915;
+   int i;
+   if      (dbm <= -30) i = 0;
+   else if (dbm <= -20) i = 1;
+   else if (dbm <= -15) i = 2;
+   else if (dbm <= -10) i = 3;
+   else if (dbm <=  -6) i = 4;
+   else if (dbm <=   0) i = 5;
+   else if (dbm <=   5) i = 6;
+   else if (dbm <=   7) i = 7;
+   else if (dbm <=  10) i = 8;
+   else                 i = 9;
+   return t[i];
+}
+//------------------------------------------------------------------------------------------------------------------
+void rl_arm_ook_tx(int dbm)
+{
+   if (!s_radio) return;
+   s_radio->standby();
+   // force ASK/OOK modulation format (MDMCFG2[6:4]) in case something changed it
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_MDMCFG2,
+                           RADIOLIB_CC1101_MOD_FORMAT_ASK_OOK, 6, 4);
+   // FREND0.PA_POWER=1 so the modulator keys between PATABLE[0] and PATABLE[1]
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_FREND0, 0x11);
+   // two-level OOK table: space = 0x00 (carrier off), mark = band power byte
+   uint8_t pa[2] = { 0x00, rl_power_byte_for_dbm(dbm) };
+   s_radio->getMod()->SPIwriteRegisterBurst(RADIOLIB_CC1101_REG_PATABLE, pa, 2);
+}
+//------------------------------------------------------------------------------------------------------------------
+// ELECHOUSE's per-band FSCTRL0 trim table (SmartRC_CC1101.h clb1..clb4 defaults).
+// Index 0=315MHz band, 1=433MHz band, 2=868MHz band, 3=915MHz band.
+static const uint8_t FSCTRL0_TRIM[4][2] = { {24,28}, {31,38}, {65,76}, {77,79} };
+//------------------------------------------------------------------------------------------------------------------
+static uint8_t rl_map_u8(long x, long inMin, long inMax, long outMin, long outMax)
+{
+   // Integer map(), matching Arduino's map() exactly (including the implicit
+   // float->long truncation ELECHOUSE's setMHZ(float) applies to its MHz
+   // argument before interpolating - replicated here via the (long) cast at
+   // the call site, not inside this helper).
+   return (uint8_t)((x - inMin) * (outMax - outMin) / (inMax - inMin) + outMin);
+}
+//------------------------------------------------------------------------------------------------------------------
+void rl_apply_freq_calibration(float mhz)
+{
+   if (!s_radio) return;
+   long f = (long)mhz;   // ELECHOUSE's setMHZ() truncates the same way via map(int,...)
+   uint8_t fsctrl0;
+   bool aboveThresh;
+   int band;   // 0=315, 1=433, 2=868, 3=915
+
+   if      (mhz >= 300.0f && mhz <= 348.0f)   { band = 0; fsctrl0 = rl_map_u8(f, 300, 348, FSCTRL0_TRIM[0][0], FSCTRL0_TRIM[0][1]); aboveThresh = (mhz >= 322.88f); }
+   else if (mhz >= 378.0f && mhz <= 464.0f)   { band = 1; fsctrl0 = rl_map_u8(f, 378, 464, FSCTRL0_TRIM[1][0], FSCTRL0_TRIM[1][1]); aboveThresh = (mhz >= 430.5f);  }
+   else if (mhz >= 779.0f && mhz <= 899.99f)  { band = 2; fsctrl0 = rl_map_u8(f, 779, 899, FSCTRL0_TRIM[2][0], FSCTRL0_TRIM[2][1]); aboveThresh = (mhz >= 861.0f);  }
+   else if (mhz >= 900.0f && mhz <= 928.0f)   { band = 3; fsctrl0 = rl_map_u8(f, 900, 928, FSCTRL0_TRIM[3][0], FSCTRL0_TRIM[3][1]); aboveThresh = true; }
+   else return;   // out of range, nothing to apply
+
+   // FSCTRL0: manual frequency-offset trim. Auto-calibration never touches this
+   // register, so without this write it silently stays at the chip's reset
+   // value (0) under RadioLib - a fixed, uncorrected offset versus the old
+   // ELECHOUSE build, on the order of tens of kHz depending on band/frequency.
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_FSCTRL0, fsctrl0);
+
+   // documented CC1101 VCO/charge-pump calibration workaround for the upper
+   // portion of each sub-band
+   if (aboveThresh)
+   {
+      s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_TEST0, 0x09);
+      uint8_t cur = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_FSCAL2);
+      if (cur < 32) s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_FSCAL2, (uint8_t)(cur + 32));
+   }
+   else if (band == 0 || band == 1)   // 315/433 bands have a below-threshold branch too
+   {
+      s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_TEST0, 0x0B);
+   }
+}
+//------------------------------------------------------------------------------------------------------------------
+void rl_set_freq_mhz(float mhz)
+{
+   s_freqMhz = mhz;
+   if (!s_radio) return;
+   s_radio->setFrequency(mhz);
+   rl_apply_freq_calibration(mhz);
+}
 void rl_set_bitrate_kbps(float k)   { if (s_radio) s_radio->setBitRate(k); }
 void rl_set_dev_khz(float k)        { if (s_radio) s_radio->setFrequencyDeviation(k); }
 void rl_set_rxbw_khz(float k)       { if (s_radio) s_radio->setRxBandwidth(k); }
@@ -190,5 +303,94 @@ int rl_transmit(const uint8_t* buf, int len)
 {
    if (!s_radio) return -1;
    return s_radio->transmit(buf, (size_t)len);
+}
+//------------------------------------------------------------------------------------------------------------------
+// Stream an arbitrary-length raw bitstream through the TX FIFO, with every bit
+// clocked out by the chip's own bit-rate generator (hardware timing, no MCU
+// busy-wait jitter) - unlike the GDO0 direct-mode path in radio_pulses.ino.
+//
+// RadioLib's own transmit()/startTransmit() refuse anything over 255 bytes
+// (RADIOLIB_CC1101_MAX_PACKET_LENGTH), so this bypasses them and refills the
+// FIFO continuously from 'data' instead, using the same low-level SPI
+// primitives as rl_arm_ook_tx()/rl_apply_freq_calibration() above.
+//
+// Framing is turned off entirely so the bytes given go out completely
+// unframed - bit for bit what the caller put in, nothing prepended and
+// nothing appended:
+//   - PKTCTRL0.LENGTH_CONFIG = INFINITE (no length byte, no 255B cap)
+//   - PKTCTRL0.PKT_FORMAT    = NORMAL (FIFO-fed, as opposed to GDO0 async)
+//   - MDMCFG2.SYNC_MODE      = NONE (CC1101 normally auto-inserts a hardware
+//     preamble + sync word before FIFO data in this format; NONE is the one
+//     setting documented to suppress both, so our bytes are not preceded by
+//     anything we did not put there ourselves)
+// The caller's own packet-mode config (sync word, CRC, length mode, etc.) is
+// saved and restored exactly, so this is a self-contained burst, not a
+// lasting mode switch - callers using normal packet TX elsewhere are
+// unaffected. FREND0/PATABLE OOK arming is unrelated to framing and must
+// still be done by the caller (same armOokTx() as the GDO0 path) before TX.
+//
+// CC1101::SPIsendCommand() is protected (not reachable from this free
+// function); it only forwards to Module::SPItransferStream(), which IS
+// public, so strobe commands here go through that directly - same call RadioLib
+// itself makes internally (verified in CC1101::SPIsendCommand's own body).
+static void rl_strobe(uint8_t cmd)
+{
+   s_radio->getMod()->SPItransferStream(&cmd, 1, true, NULL, NULL, 0, false);
+}
+//------------------------------------------------------------------------------------------------------------------
+// Returns 0 on success, -1 on bad args, -2 on a FIFO underrun/stall timeout.
+int rl_transmit_raw_bits(const uint8_t* data, size_t nbytes)
+{
+   if (!s_radio || data == NULL || nbytes == 0) return -1;
+
+   s_radio->standby();
+
+   uint8_t savedPktctrl0 = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_PKTCTRL0);
+   uint8_t savedMdmcfg2  = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_MDMCFG2);
+
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_PKTCTRL0, RADIOLIB_CC1101_LENGTH_CONFIG_INFINITE, 1, 0);
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_PKTCTRL0, RADIOLIB_CC1101_PKT_FORMAT_NORMAL, 5, 4);
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_MDMCFG2, RADIOLIB_CC1101_SYNC_MODE_NONE, 2, 0);
+
+   rl_strobe(RADIOLIB_CC1101_CMD_FLUSH_TX);
+
+   size_t sent    = (nbytes < RADIOLIB_CC1101_FIFO_SIZE) ? nbytes : RADIOLIB_CC1101_FIFO_SIZE;
+   s_radio->getMod()->SPIwriteRegisterBurst(RADIOLIB_CC1101_REG_FIFO, data, sent);
+
+   rl_strobe(RADIOLIB_CC1101_CMD_TX);
+
+   int ret = 0;
+   uint32_t start = millis();
+   while (sent < nbytes)
+   {
+      uint8_t txbytes = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_TXBYTES, 6, 0);
+      size_t  freeSp  = (txbytes < RADIOLIB_CC1101_FIFO_SIZE) ? (RADIOLIB_CC1101_FIFO_SIZE - txbytes) : 0;
+      size_t  chunk   = nbytes - sent;
+      if (chunk > freeSp) chunk = freeSp;
+      if (chunk > 0)
+      {
+         s_radio->getMod()->SPIwriteRegisterBurst(RADIOLIB_CC1101_REG_FIFO, &data[sent], chunk);
+         sent += chunk;
+      }
+      if (millis() - start > 2000) { ret = -2; break; }   // underrun/stall guard
+   }
+
+   if (ret == 0)
+   {
+      // Infinite-length mode never ends the packet by itself: wait for the
+      // FIFO to actually drain to the modulator before leaving TX, or the
+      // last few bits get cut off when we strobe IDLE.
+      start = millis();
+      while ((uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_TXBYTES, 6, 0) != 0)
+      {
+         if (millis() - start > 2000) { ret = -2; break; }
+      }
+   }
+
+   s_radio->standby();
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_PKTCTRL0, savedPktctrl0);
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_MDMCFG2, savedMdmcfg2);
+
+   return ret;
 }
 //------------------------------------------------------------------------------------------------------------------

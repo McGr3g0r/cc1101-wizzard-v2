@@ -11,6 +11,7 @@
 // no RadioLib types. The CC1101 wrapper (cc1101.ino) calls these.
 //------------------------------------------------------------------------------------------------------------------
 #include <stdint.h>
+#include <stddef.h>   // size_t
 //------------------------------------------------------------------------------------------------------------------
 // lifecycle
 bool rl_begin(int csPin, int gdo0Pin, int gdo2Pin,
@@ -24,9 +25,25 @@ int  rl_partnum(void);
 int  rl_get_reg(int addr);            // read one CC1101 config register (diagnostic)
 void rl_get_patable(uint8_t* out2);   // read PATABLE[0] and PATABLE[1]
 int  rl_set_ook_patable(int powerByte); // IDLE->write FREND0+PATABLE{0,byte}->read back [1] (diagnostic)
+// Map a dBm value to the CC1101 PATABLE power byte for the CURRENT frequency
+// band, using the TI/ELECHOUSE recommended tables (so OOK output matches the
+// old ELECHOUSE build). Band is picked from the last frequency set.
+uint8_t rl_power_byte_for_dbm(int dbm);
+// Arm the chip for clean 100% OOK before a GDO0-driven direct transmit:
+// IDLE -> force ASK/OOK mod format -> FREND0=0x11 (PA_POWER=1) ->
+// PATABLE={0x00, byte(dbm)}. Space = carrier fully off, mark = full power.
+// This reproduces what the ELECHOUSE setCCMode(0)/setModulation path did
+// implicitly before every transmit. Leaves the chip in standby.
+void rl_arm_ook_tx(int dbm);
 //------------------------------------------------------------------------------------------------------------------
 // parameters (high-level, handled by RadioLib)
 void rl_set_freq_mhz(float mhz);
+// Ported from ELECHOUSE's Calibrate()/setMHZ(): sets the FSCTRL0 frequency-trim
+// register (RadioLib's setFrequency() never touches it, so it stays 0) and
+// applies CC1101's documented above-threshold TEST0/FSCAL2 VCO calibration
+// workaround for the upper part of each ISM sub-band. Called automatically by
+// rl_set_freq_mhz(); exposed in case a caller needs to reapply it explicitly.
+void rl_apply_freq_calibration(float mhz);
 void rl_set_bitrate_kbps(float kbps);
 void rl_set_dev_khz(float khz);
 void rl_set_rxbw_khz(float khz);
@@ -68,6 +85,11 @@ void rl_idle(void);            // standby
 bool rl_rx_available(void);                              // packet waiting?
 int  rl_receive(uint8_t* buf, int maxlen, int* crcOk);   // read packet, returns length
 int  rl_transmit(const uint8_t* buf, int len);           // blocking packet transmit, 0 = ok
+// Hardware-clocked raw bitstream TX via continuous FIFO refill, no 255B cap,
+// no preamble/sync framing - see the implementation comment for details.
+// Caller must have already called rl_arm_ook_tx()/armOokTx() for OOK.
+// Returns 0 on success, -1 bad args, -2 underrun/stall.
+int  rl_transmit_raw_bits(const uint8_t* data, size_t nbytes);
 //------------------------------------------------------------------------------------------------------------------
 #endif// __RL_CC1101_H__
 //------------------------------------------------------------------------------------------------------------------

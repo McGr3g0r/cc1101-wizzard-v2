@@ -80,7 +80,14 @@ int radio_pulses_capture(int startOffset, int minPulseUs, int maxSpaceUs)
        s = micros();
        while ((idx < radio_pulses_buffer_len) && (micros() - s < maxSpaceUs) && (micros() - grabStart < RADIO_PULSES_MAX_GRAB_US))
        {
-            while ((digitalRead(gdo0) == curr_val) && (micros() - s < maxSpaceUs) && (micros() - grabStart < RADIO_PULSES_MAX_GRAB_US));
+            // Precision-critical: exactly ONE micros() call per poll, same as the
+            // original ELECHOUSE-era capture. The 250ms absolute-grab-time cap is
+            // enforced once per EDGE by the outer loop above, not here - adding a
+            // second micros() call to this innermost busy-wait biases every
+            // measured pulse width long by its extra per-iteration overhead,
+            // which can push captured timing outside a strict receiver's
+            // tolerance even though a lenient receiver never notices.
+            while ((digitalRead(gdo0) == curr_val) && (micros() - s < maxSpaceUs));
             s2 = micros();
             tdiff = s2 - s;
             if (tdiff < maxSpaceUs)
@@ -106,6 +113,12 @@ int radio_pulses_send(int startOffset, int pulses)
         RadioDev* radio = getRadio();        
         radio->setCCMode(0); 
         radio->setPacketFormat(3);
+        // Re-arm the OOK PA table (FREND0=0x11, PATABLE={0x00, power}) so the
+        // carrier is fully off between marks. Without this, RadioLib's init-time
+        // table was relied on and the "space" level could leak carrier, which
+        // professional (superhet/AGC) receivers fail to slice. Must precede the
+        // STX issued by setTX(); PATABLE survives the standby inside direct TX.
+        radio->armOokTx();
         radio->setTX();
 
         pinMode(gdo0, OUTPUT);
@@ -148,6 +161,128 @@ int radio_pulses_send(int startOffset, int pulses)
     }
 
     return total_us;
+}
+//------------------------------------------------------------------------------------------------------------------
+// Scratch space for the FIFO/hardware-clocked send path below. Deliberately
+// separate from radio_pulses_buffer/radio_buffer (which alias the SAME
+// physical RAM - see radio_buffer.ino) so packing a bitstream here can never
+// overwrite the stored pulse train it was built from; radio_pulses_send_fifo()
+// leaves the stored pulses untouched, same invariant as radio_pulses_send().
+#define RADIO_PULSES_FIFO_SCRATCH_BYTES 2048
+static uint8_t radio_pulses_fifo_scratch[RADIO_PULSES_FIFO_SCRATCH_BYTES];
+//------------------------------------------------------------------------------------------------------------------
+// Convert 'pulses' stored microsecond durations (from startOffset) into a
+// packed, MSB-first bitstream for RadioDev::sendRawBits(): each pulse becomes
+// round(duration_us / unitUs) bits of the same level, alternating level the
+// same way radio_pulses_send() does (starts HIGH('1'), toggles after every
+// pulse). The last byte is zero-padded (trailing pad = carrier off - harmless
+// silence appended after the real data, same as the GDO0 path ending low).
+// Returns the number of packed bytes written, or a negative value: -1 bad
+// args, -2 result does not fit RADIO_PULSES_FIFO_SCRATCH_BYTES (too many
+// pulses/too fine a unit for one call - split into smaller play ranges, or
+// use a coarser unitUs).
+static int radio_pulses_pack_bits(int startOffset, int pulses, int unitUs)
+{
+   if (unitUs < 1 || pulses <= 0 || startOffset < 0 || startOffset >= radio_pulses_buffer_len)
+      return -1;
+
+   int     bitpos  = 0;      // 0..7 within the byte being built
+   int     bytepos = 0;
+   uint8_t curByte = 0;
+   uint8_t curr_val = 1;     // matches radio_pulses_send(): starts HIGH, toggles each pulse
+
+   for (int idx = startOffset; idx < startOffset + pulses; idx++)
+   {
+      if (idx >= radio_pulses_buffer_len) break;
+
+      long nbits = ((long)radio_pulses_buffer[idx] + (unitUs / 2)) / unitUs;   // round to nearest
+      if (nbits < 1) nbits = 1;   // never drop an edge entirely
+
+      for (long b = 0; b < nbits; b++)
+      {
+         curByte = (uint8_t)((curByte << 1) | (curr_val & 0x01));
+         bitpos++;
+         if (bitpos == 8)
+         {
+            if (bytepos >= RADIO_PULSES_FIFO_SCRATCH_BYTES) return -2;
+            radio_pulses_fifo_scratch[bytepos++] = curByte;
+            curByte = 0;
+            bitpos = 0;
+         }
+      }
+      curr_val ^= 0x01;
+   }
+   if (bitpos > 0)
+   {
+      curByte = (uint8_t)(curByte << (8 - bitpos));   // zero-pad the remaining low bits
+      if (bytepos >= RADIO_PULSES_FIFO_SCRATCH_BYTES) return -2;
+      radio_pulses_fifo_scratch[bytepos++] = curByte;
+   }
+   return bytepos;
+}
+//------------------------------------------------------------------------------------------------------------------
+// Hardware-clocked alternative to radio_pulses_send(): packs the given stored
+// pulses into a bitstream at a fixed 'unitUs' quantum (see
+// radio_pulses_pack_bits()) and streams it through the TX FIFO
+// (RadioDev::sendRawBits -> rl_transmit_raw_bits), instead of bit-banging
+// GDO0. Bit timing is then set by the radio's own bit-rate generator, not by
+// an MCU busy-wait loop. Trade-off: every pulse is rounded to a whole number
+// of 'unitUs' quanta, so pick unitUs no larger than ~1/8 of the shortest real
+// pulse you need to reproduce to keep the rounding error well under what a
+// receiver's own timing tolerance absorbs. DRATE (the register that actually
+// sets how long each bit is on air) is derived from unitUs and set/restored
+// automatically around the transmit - the caller does not set it separately.
+// Returns the represented duration in microseconds (post-quantization) on
+// success, or a negative value on error: -1 bad args, -2 does not fit the
+// scratch buffer, -3 FIFO underrun/stall during transmit. Does not touch the
+// stored pulse buffer (same invariant as radio_pulses_send()).
+long radio_pulses_send_fifo(int startOffset, int pulses, int unitUs)
+{
+   int nbytes = radio_pulses_pack_bits(startOffset, pulses, unitUs);
+   if (nbytes <= 0) return nbytes;
+
+   RadioDev* radio = getRadio();
+
+   // Each packed bit is meant to occupy exactly unitUs on air - that is set by
+   // DRATE, not by anything in rl_transmit_raw_bits(). Deriving it here from
+   // unitUs (rather than asking the caller to set DRATE separately beforehand)
+   // means there is one knob, not two that have to be kept in sync by hand -
+   // whatever unitUs was used to pack the bits is exactly what the radio is
+   // clocking them out at. Restored afterwards, same as PKTCTRL0/MDMCFG2 are
+   // restored inside rl_transmit_raw_bits() - a self-contained burst, not a
+   // lasting change to the active profile's data rate.
+   int savedDrate = radio->getDataRate();
+   long targetBaud = (1000000L + (unitUs / 2)) / unitUs;   // round to nearest
+   if (targetBaud < 20L)      targetBaud = 20L;             // RadioLib/CC1101 floor
+   if (targetBaud > 1621830L) targetBaud = 1621830L;        // RadioLib/CC1101 ceiling
+   radio->setDataRate((int)targetBaud);
+
+   // Same OOK PA-table arming as the GDO0 path - how the bits reach the
+   // modulator (FIFO vs GDO0) is unrelated to how OOK keying itself works.
+   radio->armOokTx();
+
+   digitalWrite(RXLED, LOW);
+   int st = radio->sendRawBits(radio_pulses_fifo_scratch, nbytes);
+   digitalWrite(RXLED, HIGH);
+
+   radio->setDataRate(savedDrate);   // restore the profile's own data rate
+
+   // same end-state as radio_pulses_send(), regardless of which path was used
+   radio->setCCMode(1);
+   radio->setPacketFormat(0);
+   radio->setRX();
+
+   if (st != 0) return -3;
+
+   long total_us = 0;
+   for (int idx = startOffset; idx < startOffset + pulses; idx++)
+   {
+      if (idx >= radio_pulses_buffer_len) break;
+      long nbits = ((long)radio_pulses_buffer[idx] + (unitUs / 2)) / unitUs;
+      if (nbits < 1) nbits = 1;
+      total_us += nbits * unitUs;
+   }
+   return total_us;
 }
 //------------------------------------------------------------------------------------------------------------------
 int radio_pulses_add(uint16_t pulse)

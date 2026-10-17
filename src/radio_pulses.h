@@ -13,6 +13,11 @@ int radio_pulses_grab(Stream& input, int startOffset, int minPulseUs, int maxSpa
 // (see loop1) so its busy-wait never blocks core0's USB/CLI. For the monitor.
 int radio_pulses_capture(int startOffset, int minPulseUs, int maxSpaceUs);
 int radio_pulses_send(int startOffset, int pulses);
+// Hardware-clocked alternative to radio_pulses_send() via the TX FIFO instead
+// of GDO0 bit-banging - see the .ino for details and the quantization trade-off.
+// DRATE is derived from unitUs and applied/restored automatically; do not set
+// it separately beforehand.
+long radio_pulses_send_fifo(int startOffset, int pulses, int unitUs);
 int radio_pulses_set(int startOffset, uint16_t pulse);
 int radio_pulses_add(uint16_t pulse);
 //------------------------------------------------------------------------------------------------------------------

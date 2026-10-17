@@ -176,10 +176,25 @@ int RadioDev::getTX(void) { return txen; }
 void RadioDev::setCCMode(int mode) { this->ccmode = mode; }
 int  RadioDev::getCCMode(void)     { return ccmode; }
 //------------------------------------------------------------------------------------------------------------------
+void RadioDev::armOokTx(void)
+{
+   // Only meaningful for OOK: forces FREND0=0x11 + PATABLE={0x00, power(pa)} so
+   // the GDO0 bit-bang produces full 100% ASK (carrier off in the spaces). The
+   // ELECHOUSE build did this implicitly via setCCMode(0)->setModulation; the
+   // RadioLib path only set PATABLE once at init, so it is re-armed here.
+   if (mod == 2) rl_arm_ook_tx(pa);
+}
+//------------------------------------------------------------------------------------------------------------------
 void RadioDev::sendData(uint8_t* data, int len)
 {
    if (len > 64) len = 64;
    rl_transmit(data, len);
+}
+//------------------------------------------------------------------------------------------------------------------
+int RadioDev::sendRawBits(uint8_t* data, int nbytes)
+{
+   if (nbytes <= 0) return -1;
+   return rl_transmit_raw_bits(data, (size_t)nbytes);
 }
 //------------------------------------------------------------------------------------------------------------------
 void RadioDev::setIdle(void)

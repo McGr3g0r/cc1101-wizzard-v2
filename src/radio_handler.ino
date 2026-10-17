@@ -286,7 +286,7 @@ static CmdStatus_e radio_jam(RadioDev* r, int nval, char** vals, CmdHandler* h)
 //------------------------------------------------------------------------------------------------------------------
 static CmdStatus_e radio_pulses_cmd(int nval, char** vals, CmdHandler* h)
 {
-   if (nval < 1) { h->setHint("pulses count|flush|show|grab|play|add"); return NOT_ENOUGH_PARAMS; }
+   if (nval < 1) { h->setHint("pulses count|flush|show|grab|play|playfifo|add"); return NOT_ENOUGH_PARAMS; }
    const char* a = vals[0];
 
    if (!strcmp(a, "count"))
@@ -350,6 +350,52 @@ static CmdStatus_e radio_pulses_cmd(int nval, char** vals, CmdHandler* h)
          }
       }
       STDOUT.print("pulses sent: "); STDOUT.print(totalUs); STDOUT.print(" uS");
+      if (repeat > 1) { STDOUT.print(" x"); STDOUT.print(repeat); }
+      STDOUT.println(".");
+      return OK;
+   }
+   if (!strcmp(a, "playfifo"))
+   {
+      // Hardware-clocked alternative to 'play': streams the pulses through the
+      // TX FIFO at a fixed unitUs quantum instead of bit-banging gdo0 - see
+      // radio_pulses_send_fifo(). unitUs has no sensible firmware-side default
+      // (it depends entirely on the protocol being replayed), so it is
+      // required, not optional.
+      if (monitor_active()) { h->setHint("monitor is running - stop it first ('monitor stop')"); return WRONG_PARAMS; }
+      if (nval < 4) { h->setHint("pulses playfifo <off> <n> <unitUs> [repeat] [gapUs]"); return NOT_ENOUGH_PARAMS; }
+      int offs   = atoi(vals[1]);
+      int total  = atoi(vals[2]);
+      int unitUs = atoi(vals[3]);
+      int  repeat = (nval >= 5) ? atoi(vals[4]) : 1;
+      long gapUs  = (nval >= 6) ? atol(vals[5]) : 0;
+      int stored = radio_pulses_get_count();
+      if (offs < 0 || offs >= stored) { h->setHint("pulses playfifo: off out of range"); return WRONG_PARAMS; }
+      if (total <= 0 || (offs + total > stored)) { h->setHint("pulses playfifo: off+n exceeds stored count"); return WRONG_PARAMS; }
+      if (unitUs < 1) { h->setHint("pulses playfifo: unitUs must be > 0"); return WRONG_PARAMS; }
+      if (repeat < 1) { h->setHint("pulses playfifo: repeat >= 1"); return WRONG_PARAMS; }
+      if (gapUs < 0)  { h->setHint("pulses playfifo: gapUs >= 0"); return WRONG_PARAMS; }
+
+      long totalUs = 0;
+      for (int r = 0; r < repeat; r++)
+      {
+         long rc = radio_pulses_send_fifo(offs, total, unitUs);
+         if (rc < 0)
+         {
+            const char* why = (rc == -1) ? "bad arguments"
+                             : (rc == -2) ? "pulse train too long for the FIFO scratch buffer at this unitUs - use a coarser unitUs or fewer pulses"
+                             :              "FIFO underrun/stall during transmit";
+            h->setHint(why);
+            return CC_ERROR;
+         }
+         totalUs += rc;
+         if (r < repeat - 1 && gapUs > 0)
+         {
+            uint32_t g = micros();
+            while ((uint32_t)(micros() - g) < (uint32_t)gapUs);
+         }
+      }
+      STDOUT.print("pulses sent (fifo, unit="); STDOUT.print(unitUs); STDOUT.print("uS): ");
+      STDOUT.print(totalUs); STDOUT.print(" uS");
       if (repeat > 1) { STDOUT.print(" x"); STDOUT.print(repeat); }
       STDOUT.println(".");
       return OK;

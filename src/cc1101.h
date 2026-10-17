@@ -84,12 +84,25 @@ class RadioDev {
         void setTX();
         int getTX(void);
 
+        // Arm a clean two-level OOK PA table (FREND0=0x11, PATABLE={0x00,power})
+        // right before a GDO0-driven direct transmit. No-op unless modulation is
+        // OOK. Call after setCCMode(0)/setPacketFormat(3) and before setTX().
+        void armOokTx(void);
+
         static String modulation(int mod);
 
         void setCCMode(int mode);
         int getCCMode(void);
 
         void sendData(uint8_t* data, int len);
+
+        // Hardware-clocked alternative to the GDO0 bit-bang path in
+        // radio_pulses.ino: streams 'nbytes' through the TX FIFO with bit
+        // timing set by the radio's own bit-rate generator, unframed (no
+        // preamble/sync/length byte), via rl_transmit_raw_bits(). Caller must
+        // call armOokTx() first for OOK, same as before setTX() on the GDO0
+        // path. Returns 0 on success.
+        int sendRawBits(uint8_t* data, int nbytes);
 
         // v2: packet-mode receive (FSK/GFSK/MSK/4-FSK and OOK in packet mode)
         void setIdle(void);                 // put transceiver in IDLE state
