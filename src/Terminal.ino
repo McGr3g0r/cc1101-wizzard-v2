@@ -35,12 +35,14 @@ void Terminal::input(Stream& term)
                  else
                     buffer = "";
                     
-                if (echoEnabled) term.write("\b \b");
+                if (echoEnabled && Serial.availableForWrite() >= 3) term.write("\b \b");
 
             }
         }
         else if (data == '\r' || data == '\n' ) {
-            if (echoEnabled) term.write("\r\n");    // output CRLF
+            // non-blocking CRLF echo (see note below): a full TX buffer must not
+            // block core0 at end-of-line on a long command
+            if (echoEnabled && Serial.availableForWrite() >= 2) term.write("\r\n");    // output CRLF
 
             if (buffer.length() > 0)
             {
@@ -51,8 +53,13 @@ void Terminal::input(Stream& term)
         }
         else if (buffer.length() < CMD_MAX_BUFFER_LEN - 1) {
             buffer += (char)data;
-            if (echoEnabled) term.write(data);
-        }  
+            // NON-BLOCKING echo: only echo if the USB TX buffer has room. A long
+            // line (e.g. 'pulses add <many>') would otherwise fill the TX FIFO
+            // while the host is still sending (not reading), and term.write()
+            // would block core0 -> USB stalls -> connection drops. Echo is a
+            // convenience, so skipping it under back-pressure is safe.
+            if (echoEnabled && Serial.availableForWrite() > 0) term.write(data);
+        }
     }
 }
 //------------------------------------------------------------------------------------------------------------------    

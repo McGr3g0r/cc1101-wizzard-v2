@@ -21,6 +21,9 @@ bool rl_present(void);
 int  rl_begin_status(void);   // RadioLib begin() return code (diagnostic)
 int  rl_version(void);
 int  rl_partnum(void);
+int  rl_get_reg(int addr);            // read one CC1101 config register (diagnostic)
+void rl_get_patable(uint8_t* out2);   // read PATABLE[0] and PATABLE[1]
+int  rl_set_ook_patable(int powerByte); // IDLE->write FREND0+PATABLE{0,byte}->read back [1] (diagnostic)
 //------------------------------------------------------------------------------------------------------------------
 // parameters (high-level, handled by RadioLib)
 void rl_set_freq_mhz(float mhz);

@@ -44,7 +44,8 @@ void radio_profile_exec_line(void* ctx, const char* line);  // defined in radio_
 #define MON_FMT_HEX  1
 #define MOD_OOK      2
 #define MON_OOK_MIN_PULSES 8          // ignore shorter noise bursts
-#define MON_OOK_MAX_PULSES 2048       // above this it's just noise filling the buffer -> skip
+#define MON_OOK_MAX_PULSES 1024       // above this it's just noise filling the buffer -> skip
+                                      // (also caps emit size so a noise frame can't block serial for ~1s)
 #define MON_OOK_DEF_MINUS  100
 #define MON_OOK_DEF_MAXGAP 15000
 #define MON_OOK_RSSI_GATE  -85       // dBm: only capture when RSSI is above this (carrier present)

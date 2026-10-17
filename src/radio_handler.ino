@@ -28,9 +28,11 @@
 #include "radio_pulses.h"
 #include "radio_raw.h"
 #include "radio_buffer.h"
+#include "rl_cc1101.h"
 #include "utils.h"
 //------------------------------------------------------------------------------------------------------------------
 CmdHandler* getRootCommandHandler(void);
+bool monitor_active(void);   // defined in Monitor.ino
 extern int RXLED;
 //------------------------------------------------------------------------------------------------------------------
 CmdStatus_e radio_main(void* parent, int argc, char* argv[]);
@@ -69,7 +71,7 @@ static void radio_usage(void)
    STDOUT.println("- <iface> set <param> <val> : set any parameter (also set_<param> <val>)");
    STDOUT.println("- <iface> set mod <2fsk|gfsk|ook|4fsk|msk|0..4>");
    STDOUT.println("- <iface> set syncword <high> <low>");
-   STDOUT.println("- <iface> rx | tx | idle | reset | rssi");
+   STDOUT.println("- <iface> rx | tx | idle | reset | rssi | regs");
    STDOUT.println("- <iface> scan <startKHz> <stopKHz>");
    STDOUT.println("- <iface> send <hex> | jam <ms>");
    STDOUT.println("- <iface> pulses count|flush|show|grab <off> <minUs> <maxUs>|play <off> <n> [repeat] [gapUs]|add <v>...");
@@ -174,6 +176,33 @@ static CmdStatus_e radio_set(RadioDev* r, const char* name, int nval, char** val
    long rb = p->get(r);
    bool ok = (!strcmp(name, "freq")) ? (rb / 1000 == v / 1000) : (rb == v);
    return ok ? OK : CC_ERROR;
+}
+//------------------------------------------------------------------------------------------------------------------
+// Dump the CC1101 config registers that matter for OOK TX / decoding, so the
+// live config can be compared against a known-good (e.g. ELECHOUSE) setup.
+static void radio_regs(RadioDev* r)
+{
+   STDOUT.print("version=0x"); STDOUT.print(r->version(), HEX);
+   STDOUT.print(" partnum=0x"); STDOUT.println(r->partnum(), HEX);
+
+   static const struct { const char* n; uint8_t a; } REGS[] = {
+      { "IOCFG2",  0x00 }, { "IOCFG0",  0x02 }, { "FIFOTHR", 0x03 },
+      { "PKTCTRL1",0x07 }, { "PKTCTRL0",0x08 },
+      { "FREND0",  0x22 },
+      { "MDMCFG4", 0x10 }, { "MDMCFG3", 0x11 }, { "MDMCFG2", 0x12 },
+      { "MDMCFG1", 0x13 }, { "MDMCFG0", 0x14 }, { "DEVIATN", 0x15 },
+   };
+   for (unsigned i = 0; i < sizeof(REGS) / sizeof(REGS[0]); i++)
+   {
+      int v = rl_get_reg(REGS[i].a) & 0xFF;
+      STDOUT.print("  "); STDOUT.print(REGS[i].n);
+      STDOUT.print("(0x"); if (REGS[i].a < 0x10) STDOUT.print("0"); STDOUT.print(REGS[i].a, HEX);
+      STDOUT.print(")=0x"); if (v < 0x10) STDOUT.print("0"); STDOUT.println(v, HEX);
+   }
+   uint8_t pa[2];
+   rl_get_patable(pa);
+   STDOUT.print("  PATABLE[0]=0x"); if (pa[0] < 0x10) STDOUT.print("0"); STDOUT.print(pa[0], HEX);
+   STDOUT.print(" PATABLE[1]=0x"); if (pa[1] < 0x10) STDOUT.print("0"); STDOUT.println(pa[1], HEX);
 }
 //------------------------------------------------------------------------------------------------------------------
 static CmdStatus_e radio_scan(RadioDev* r, int nval, char** vals, CmdHandler* h)
@@ -282,6 +311,7 @@ static CmdStatus_e radio_pulses_cmd(int nval, char** vals, CmdHandler* h)
    }
    if (!strcmp(a, "grab"))
    {
+      if (monitor_active()) { h->setHint("monitor is running - stop it first ('monitor stop')"); return WRONG_PARAMS; }
       if (nval < 4) { h->setHint("pulses grab <off> <minUs> <maxUs>"); return NOT_ENOUGH_PARAMS; }
       int offs = atoi(vals[1]);
       int mint = atol(vals[2]);
@@ -294,6 +324,7 @@ static CmdStatus_e radio_pulses_cmd(int nval, char** vals, CmdHandler* h)
    }
    if (!strcmp(a, "play"))
    {
+      if (monitor_active()) { h->setHint("monitor is running - stop it first ('monitor stop')"); return WRONG_PARAMS; }
       if (nval < 3) { h->setHint("pulses play <off> <n> [repeat] [gapUs]"); return NOT_ENOUGH_PARAMS; }
       int offs = atoi(vals[1]);
       int total = atoi(vals[2]);
@@ -354,6 +385,17 @@ static CmdStatus_e radio_dispatch(radio_iface_t* ifc, int nsub, char** sub, CmdH
    {
       STDOUT.print("rssi: "); STDOUT.print(r->getRSSI());
       STDOUT.print(" lqi: ");  STDOUT.println(r->getLQI());
+      return OK;
+   }
+   if (!strcmp(cmd, "regs"))  { radio_regs(r); return OK; }
+   if (!strcmp(cmd, "patable"))
+   {
+      if (nsub < 2) { h->setHint("patable <byte> e.g. 0xC0 (diagnostic: write OOK PATABLE[1] + read back)"); return NOT_ENOUGH_PARAMS; }
+      int want = (int)strtol(sub[1], 0, 0) & 0xFF;
+      int got  = rl_set_ook_patable(want) & 0xFF;
+      STDOUT.print("PATABLE[1] wrote=0x"); if (want < 0x10) STDOUT.print("0"); STDOUT.print(want, HEX);
+      STDOUT.print(" readback=0x");        if (got  < 0x10) STDOUT.print("0"); STDOUT.print(got, HEX);
+      STDOUT.println(want == got ? "  (OK: write sticks)" : "  (MISMATCH: write ignored)");
       return OK;
    }
    if (!strcmp(cmd, "get"))

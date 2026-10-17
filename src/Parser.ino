@@ -17,6 +17,7 @@ bool Parser::parse(String line)
        while (idx < line.length() && buffer[idx] != ' ') idx++;
        if (start != idx)
        {
+           if (argc >= PARSER_MAX_PARAMS) break;   // never write past argv[] (overflow = crash)
            argv[argc++] = &buffer[start];
            buffer[idx++] = 0;
        }

@@ -14,6 +14,7 @@ class RLCC1101 : public CC1101 {
     RLCC1101(Module* m) : CC1101(m) {}
     using CC1101::SPIsetRegValue;
     using CC1101::SPIgetRegValue;
+    using CC1101::getMod;
 };
 //------------------------------------------------------------------------------------------------------------------
 static Module*   s_mod    = nullptr;
@@ -54,6 +55,32 @@ bool rl_present(void)  { return s_ok; }
 int  rl_begin_status(void) { return s_beginSt; }
 int  rl_version(void)  { return s_radio ? s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_VERSION) : 0; }
 int  rl_partnum(void)  { return s_radio ? s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_PARTNUM) : 0; }
+//------------------------------------------------------------------------------------------------------------------
+// Diagnostics: read a single config register, and the two OOK PATABLE entries.
+int  rl_get_reg(int addr) { return s_radio ? (int)s_radio->SPIgetRegValue((uint8_t)addr) : -1; }
+void rl_get_patable(uint8_t* out2)
+{
+   out2[0] = 0; out2[1] = 0;
+   if (!s_radio) return;
+   uint8_t t[8] = {0};
+   // PATABLE is a special 8-byte register at 0x3E; burst-read it
+   s_radio->getMod()->SPIreadRegisterBurst(RADIOLIB_CC1101_REG_PATABLE, 8, t);
+   out2[0] = t[0];
+   out2[1] = t[1];
+}
+// Diagnostic: force IDLE, set FREND0=0x11 and PATABLE={0x00, powerByte}, then
+// read PATABLE back and return entry [1], so we can tell if the write sticks.
+int rl_set_ook_patable(int powerByte)
+{
+   if (!s_radio) return -1;
+   s_radio->standby();
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_FREND0, 0x11);
+   uint8_t pa[2] = { 0x00, (uint8_t)powerByte };
+   s_radio->getMod()->SPIwriteRegisterBurst(RADIOLIB_CC1101_REG_PATABLE, pa, 2);
+   uint8_t t[8] = {0};
+   s_radio->getMod()->SPIreadRegisterBurst(RADIOLIB_CC1101_REG_PATABLE, 8, t);
+   return t[1];
+}
 //------------------------------------------------------------------------------------------------------------------
 void rl_set_freq_mhz(float mhz)     { if (s_radio) s_radio->setFrequency(mhz); }
 void rl_set_bitrate_kbps(float k)   { if (s_radio) s_radio->setBitRate(k); }
