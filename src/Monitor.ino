@@ -1,4 +1,9 @@
 //------------------------------------------------------------------------------------------------------------------
+// Author: Grzegorz Rajtar
+// e-mail: mcgregor@blackmesaeast.com.pl
+// (c) 2026
+// Modified: 2026-10-17
+//------------------------------------------------------------------------------------------------------------------
 // monitor command (v2) - raw capture only
 //
 //   monitor start <iface> <profile> [json|hex] [minUs] [maxGapUs]

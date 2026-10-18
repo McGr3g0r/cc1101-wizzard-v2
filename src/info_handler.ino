@@ -1,4 +1,9 @@
 //------------------------------------------------------------------------------------------------------------------
+// Author: Grzegorz Rajtar
+// e-mail: mcgregor@blackmesaeast.com.pl
+// (c) 2026
+// Modified: 2026-10-16
+//------------------------------------------------------------------------------------------------------------------
 // info command (v2)
 //
 //   info        - device / firmware identification as JSON (default, host-parseable)

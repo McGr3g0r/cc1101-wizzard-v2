@@ -1,4 +1,9 @@
 //------------------------------------------------------------------------------------------------------------------
+// Author: Grzegorz Rajtar
+// e-mail: mcgregor@blackmesaeast.com.pl
+// (c) 2026
+// Modified: 2026-10-18
+//------------------------------------------------------------------------------------------------------------------
 // RadioDev wrapper - RadioLib backend.
 //
 // Same public interface as the ELECHOUSE-based version; all hardware access
