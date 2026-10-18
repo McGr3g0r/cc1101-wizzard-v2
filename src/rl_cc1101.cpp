@@ -24,6 +24,24 @@ static int      s_beginSt = 0;         // RadioLib begin() return code (diagnost
 static volatile bool s_rxFlag = false;
 static float    s_freqMhz = 433.92f;   // last frequency set; picks the PA band table
 //------------------------------------------------------------------------------------------------------------------
+// CC1101::SPIwriteRegisterBurst()/SPIreadRegisterBurst() are 'protected' (same
+// situation as SPIsetRegValue/SPIgetRegValue above, and as SPIsendCommand used
+// by rl_strobe() further down) - not reachable from this free function. Their
+// own bodies just OR in RADIOLIB_CC1101_CMD_BURST and forward to the PUBLIC
+// Module-level method of the same name, so that is replicated here directly.
+// This must NOT be replaced with a plain call to the public Module method
+// without the OR: that omits the burst bit, which is not a valid multi-byte
+// burst access on real CC1101 silicon (confirmed the hard way - see the
+// playfifo debugging history for rl_transmit_raw_bits() further down).
+static void rl_burst_write(uint8_t reg, const uint8_t* data, size_t len)
+{
+   s_radio->getMod()->SPIwriteRegisterBurst((uint8_t)(reg | RADIOLIB_CC1101_CMD_BURST), data, len);
+}
+static void rl_burst_read(uint8_t reg, uint8_t numBytes, uint8_t* inBytes)
+{
+   s_radio->getMod()->SPIreadRegisterBurst((uint8_t)(reg | RADIOLIB_CC1101_CMD_BURST), numBytes, inBytes);
+}
+//------------------------------------------------------------------------------------------------------------------
 static void rl_isr(void) { s_rxFlag = true; }
 //------------------------------------------------------------------------------------------------------------------
 static bool rl_known_version(int v)
@@ -66,7 +84,7 @@ void rl_get_patable(uint8_t* out2)
    if (!s_radio) return;
    uint8_t t[8] = {0};
    // PATABLE is a special 8-byte register at 0x3E; burst-read it
-   s_radio->getMod()->SPIreadRegisterBurst(RADIOLIB_CC1101_REG_PATABLE, 8, t);
+   rl_burst_read(RADIOLIB_CC1101_REG_PATABLE, 8, t);
    out2[0] = t[0];
    out2[1] = t[1];
 }
@@ -78,9 +96,9 @@ int rl_set_ook_patable(int powerByte)
    s_radio->standby();
    s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_FREND0, 0x11);
    uint8_t pa[2] = { 0x00, (uint8_t)powerByte };
-   s_radio->getMod()->SPIwriteRegisterBurst(RADIOLIB_CC1101_REG_PATABLE, pa, 2);
+   rl_burst_write(RADIOLIB_CC1101_REG_PATABLE, pa, 2);
    uint8_t t[8] = {0};
-   s_radio->getMod()->SPIreadRegisterBurst(RADIOLIB_CC1101_REG_PATABLE, 8, t);
+   rl_burst_read(RADIOLIB_CC1101_REG_PATABLE, 8, t);
    return t[1];
 }
 //------------------------------------------------------------------------------------------------------------------
@@ -139,7 +157,7 @@ void rl_arm_ook_tx(int dbm)
    s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_FREND0, 0x11);
    // two-level OOK table: space = 0x00 (carrier off), mark = band power byte
    uint8_t pa[2] = { 0x00, rl_power_byte_for_dbm(dbm) };
-   s_radio->getMod()->SPIwriteRegisterBurst(RADIOLIB_CC1101_REG_PATABLE, pa, 2);
+   rl_burst_write(RADIOLIB_CC1101_REG_PATABLE, pa, 2);
 }
 //------------------------------------------------------------------------------------------------------------------
 // ELECHOUSE's per-band FSCTRL0 trim table (SmartRC_CC1101.h clb1..clb4 defaults).
@@ -338,12 +356,35 @@ static void rl_strobe(uint8_t cmd)
    s_radio->getMod()->SPItransferStream(&cmd, 1, true, NULL, NULL, 0, false);
 }
 //------------------------------------------------------------------------------------------------------------------
-// Returns 0 on success, -1 on bad args, -2 on a FIFO underrun/stall timeout.
+
+// A single read of TXBYTES can be unreliable on real CC1101 silicon (a known
+// errata - RadioLib's own startTransmit() works around it the same way, with
+// the same comment): read it twice and retry until two consecutive reads
+// agree, instead of trusting one read. Skipping this can under- or over-fill
+// the TX FIFO on a glitched read, which stalls or truncates the transmission
+// - a very plausible reason for "nothing coherent goes out at all".
+static uint8_t rl_read_txbytes(void)
+{
+   uint8_t a, b;
+   do
+   {
+      a = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_TXBYTES, 6, 0);
+      b = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_TXBYTES, 6, 0);
+   } while (a != b);
+   return a;
+}
+//------------------------------------------------------------------------------------------------------------------
+// TXBYTES is read through rl_read_txbytes() (double-read-until-stable, per a
+// documented CC1101 errata - RadioLib's own startTransmit() does the same)
+// rather than a single SPIgetRegValue() call, since a glitched single read
+// can under/overfill the FIFO and silently stall the transmission.
+// Returns 0 on success, -1 on bad args, -2 on a FIFO underrun/stall timeout,
+// -4 if the chip never reached IDLE before transmit.
 int rl_transmit_raw_bits(const uint8_t* data, size_t nbytes)
 {
    if (!s_radio || data == NULL || nbytes == 0) return -1;
 
-   s_radio->standby();
+   if (s_radio->standby() != RADIOLIB_ERR_NONE) return -4;   // chip never reached IDLE
 
    uint8_t savedPktctrl0 = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_PKTCTRL0);
    uint8_t savedMdmcfg2  = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_MDMCFG2);
@@ -354,8 +395,14 @@ int rl_transmit_raw_bits(const uint8_t* data, size_t nbytes)
 
    rl_strobe(RADIOLIB_CC1101_CMD_FLUSH_TX);
 
+   // IMPORTANT: fill the FIFO through rl_burst_write() (near the top of this
+   // file), never with a plain s_radio->getMod()->SPIwriteRegisterBurst() call.
+   // CC1101's own SPIwriteRegisterBurst() ORs in RADIOLIB_CC1101_CMD_BURST
+   // before forwarding to Module, but that method is protected on CC1101; a
+   // bare Module-level call does not set that bit at all, and a multi-byte
+   // FIFO write without it is not a valid burst write on real CC1101 silicon.
    size_t sent    = (nbytes < RADIOLIB_CC1101_FIFO_SIZE) ? nbytes : RADIOLIB_CC1101_FIFO_SIZE;
-   s_radio->getMod()->SPIwriteRegisterBurst(RADIOLIB_CC1101_REG_FIFO, data, sent);
+   rl_burst_write(RADIOLIB_CC1101_REG_FIFO, data, sent);
 
    rl_strobe(RADIOLIB_CC1101_CMD_TX);
 
@@ -363,13 +410,13 @@ int rl_transmit_raw_bits(const uint8_t* data, size_t nbytes)
    uint32_t start = millis();
    while (sent < nbytes)
    {
-      uint8_t txbytes = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_TXBYTES, 6, 0);
+      uint8_t txbytes = rl_read_txbytes();
       size_t  freeSp  = (txbytes < RADIOLIB_CC1101_FIFO_SIZE) ? (RADIOLIB_CC1101_FIFO_SIZE - txbytes) : 0;
       size_t  chunk   = nbytes - sent;
       if (chunk > freeSp) chunk = freeSp;
       if (chunk > 0)
       {
-         s_radio->getMod()->SPIwriteRegisterBurst(RADIOLIB_CC1101_REG_FIFO, &data[sent], chunk);
+         rl_burst_write(RADIOLIB_CC1101_REG_FIFO, &data[sent], chunk);
          sent += chunk;
       }
       if (millis() - start > 2000) { ret = -2; break; }   // underrun/stall guard
@@ -381,7 +428,7 @@ int rl_transmit_raw_bits(const uint8_t* data, size_t nbytes)
       // FIFO to actually drain to the modulator before leaving TX, or the
       // last few bits get cut off when we strobe IDLE.
       start = millis();
-      while ((uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_TXBYTES, 6, 0) != 0)
+      while (rl_read_txbytes() != 0)
       {
          if (millis() - start > 2000) { ret = -2; break; }
       }

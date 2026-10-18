@@ -28,6 +28,7 @@ void RadioDev::default_init(void)
    setChanSpaceing(199950);
    setRxBw(812000);   // RadioLib caps rxBw at 812.0 kHz (812.5 is rejected)
    setDataRate(9600);
+   setFifoDrateCal(1000);   // neutral (1.0x) until explicitly measured/set for this board
    setPA(10);
    setSyncMode(2);
    setSyncWord(145, 211);     // swordHi=211, swordLo=145 (as before)
@@ -84,6 +85,8 @@ int  RadioDev::getRxBw(void)               { return rxbw; }
 //------------------------------------------------------------------------------------------------------------------
 void RadioDev::setDataRate(int val)        { this->drate = val; rl_set_bitrate_kbps(val / 1000.0f); }
 int  RadioDev::getDataRate(void)           { return drate; }
+void RadioDev::setFifoDrateCal(int permille) { this->fifoDrateCalPermille = permille; }
+int  RadioDev::getFifoDrateCal(void)         { return fifoDrateCalPermille; }
 //------------------------------------------------------------------------------------------------------------------
 void RadioDev::setPA(int val)              { this->pa = val; rl_set_power_dbm(val); }
 int  RadioDev::getPA(void)                 { return pa; }

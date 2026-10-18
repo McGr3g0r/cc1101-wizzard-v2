@@ -24,6 +24,9 @@ class RadioDev {
 
         void setDataRate(int val);
         int getDataRate(void);
+        // See fifoDrateCalPermille above.
+        void setFifoDrateCal(int permille);
+        int getFifoDrateCal(void);
 
         void setPA(int pa);
         int getPA(void);
@@ -122,6 +125,17 @@ class RadioDev {
         int dev;
         int rxbw;
         int drate;
+        // Per-board empirical correction for radio_pulses_send_fifo(): on at
+        // least one real CC1101 module/clone, the actual over-the-air bit
+        // period measured via SDR was ~2x shorter than MDMCFG3/MDMCFG4
+        // (verified correct against the TI datasheet DRATE formula) implied -
+        // a hardware-specific discrepancy, not a computation bug. In permille
+        // (1000 = 1.0x, no change). Applied as a multiplier on the requested
+        // baud: targetBaud = naiveTargetBaud * fifoDrateCalPermille / 1000.
+        // Default 1000 so boards without this quirk are unaffected; set via
+        // 'radio r0 set fifocal <permille>' after measuring the real
+        // discrepancy on your own hardware (e.g. via SDR), never assumed.
+        int fifoDrateCalPermille;
         int ccmode;
         int pa;
         int smode;

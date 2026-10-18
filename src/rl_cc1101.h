@@ -88,7 +88,8 @@ int  rl_transmit(const uint8_t* buf, int len);           // blocking packet tran
 // Hardware-clocked raw bitstream TX via continuous FIFO refill, no 255B cap,
 // no preamble/sync framing - see the implementation comment for details.
 // Caller must have already called rl_arm_ook_tx()/armOokTx() for OOK.
-// Returns 0 on success, -1 bad args, -2 underrun/stall.
+// Returns 0 on success, -1 bad args, -2 underrun/stall, -4 chip never reached
+// IDLE before transmit.
 int  rl_transmit_raw_bits(const uint8_t* data, size_t nbytes);
 //------------------------------------------------------------------------------------------------------------------
 #endif// __RL_CC1101_H__

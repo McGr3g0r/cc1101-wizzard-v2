@@ -345,8 +345,8 @@ static CmdStatus_e radio_pulses_cmd(int nval, char** vals, CmdHandler* h)
          // silent gap between repeats (radio is back in RX, not emitting)
          if (r < repeat - 1 && gapUs > 0)
          {
-            uint32_t g = micros();
-            while ((uint32_t)(micros() - g) < (uint32_t)gapUs);
+            uint64_t g = time_us_64();
+            while ((uint64_t)(time_us_64() - g) < (uint64_t)gapUs);
          }
       }
       STDOUT.print("pulses sent: "); STDOUT.print(totalUs); STDOUT.print(" uS");
@@ -383,15 +383,17 @@ static CmdStatus_e radio_pulses_cmd(int nval, char** vals, CmdHandler* h)
          {
             const char* why = (rc == -1) ? "bad arguments"
                              : (rc == -2) ? "pulse train too long for the FIFO scratch buffer at this unitUs - use a coarser unitUs or fewer pulses"
-                             :              "FIFO underrun/stall during transmit";
+                             : (rc == -4) ? "radio did not reach IDLE before transmit - check wiring/SPI"
+                             : (rc == -3) ? "FIFO underrun/stall during transmit"
+                             :              "transmit failed";
             h->setHint(why);
             return CC_ERROR;
          }
          totalUs += rc;
          if (r < repeat - 1 && gapUs > 0)
          {
-            uint32_t g = micros();
-            while ((uint32_t)(micros() - g) < (uint32_t)gapUs);
+            uint64_t g = time_us_64();
+            while ((uint64_t)(time_us_64() - g) < (uint64_t)gapUs);
          }
       }
       STDOUT.print("pulses sent (fifo, unit="); STDOUT.print(unitUs); STDOUT.print("uS): ");

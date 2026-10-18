@@ -62,39 +62,45 @@ int radio_pulses_grab(Stream& input, int startOffset, int minPulseUs, int maxSpa
 int radio_pulses_capture(int startOffset, int minPulseUs, int maxSpaceUs)
 {
     int idx = startOffset;
-    uint32_t s2;
+    uint64_t s2;
     int tdiff;
 
     pinMode(gdo0, INPUT);
 
-    uint32_t grabStart = micros();
-    uint32_t s = micros();
+    // time_us_64() (raw Pico SDK, reads the hardware timer directly) instead
+    // of Arduino's micros(): avoids the Arduino-core wrapper overhead and any
+    // cross-core contention with core0's own time_us_64()-based TX busy-wait
+    // (see radio_pulses_send()), for lower jitter in this precision-critical
+    // capture loop - consistent across the whole TX/RX timing path.
+    uint64_t grabStart = time_us_64();
+    uint64_t s = time_us_64();
     // wait for the signal to appear (line goes HIGH), bounded by maxSpaceUs
-    while (digitalRead(gdo0) == LOW && micros() - s < maxSpaceUs)
+    while (digitalRead(gdo0) == LOW && time_us_64() - s < (uint64_t)maxSpaceUs)
         if (STDIN.available()) { STDIN.read(); radio_pulses_cnt = startOffset; return 0; }
 
-    if (micros() - s < maxSpaceUs)
+    if (time_us_64() - s < (uint64_t)maxSpaceUs)
     {
        idx = startOffset;
        uint8_t curr_val = 1;
-       s = micros();
-       while ((idx < radio_pulses_buffer_len) && (micros() - s < maxSpaceUs) && (micros() - grabStart < RADIO_PULSES_MAX_GRAB_US))
+       s = time_us_64();
+       while ((idx < radio_pulses_buffer_len) && (time_us_64() - s < (uint64_t)maxSpaceUs) && (time_us_64() - grabStart < (uint64_t)RADIO_PULSES_MAX_GRAB_US))
        {
-            // Precision-critical: exactly ONE micros() call per poll, same as the
-            // original ELECHOUSE-era capture. The 250ms absolute-grab-time cap is
-            // enforced once per EDGE by the outer loop above, not here - adding a
-            // second micros() call to this innermost busy-wait biases every
-            // measured pulse width long by its extra per-iteration overhead,
-            // which can push captured timing outside a strict receiver's
-            // tolerance even though a lenient receiver never notices.
-            while ((digitalRead(gdo0) == curr_val) && (micros() - s < maxSpaceUs));
-            s2 = micros();
-            tdiff = s2 - s;
+            // Precision-critical: exactly ONE time_us_64() call per poll, same
+            // as the original ELECHOUSE-era capture had for micros(). The
+            // 250ms absolute-grab-time cap is enforced once per EDGE by the
+            // outer loop above, not here - adding a second timer call to this
+            // innermost busy-wait biases every measured pulse width long by
+            // its extra per-iteration overhead, which can push captured
+            // timing outside a strict receiver's tolerance even though a
+            // lenient receiver never notices.
+            while ((digitalRead(gdo0) == curr_val) && (time_us_64() - s < (uint64_t)maxSpaceUs));
+            s2 = time_us_64();
+            tdiff = (int)(s2 - s);
             if (tdiff < maxSpaceUs)
             {
                if (tdiff >= minPulseUs)
                    radio_pulses_buffer[idx++] = tdiff;
-               s = micros();
+               s = time_us_64();
                curr_val++;
                curr_val &= 0x01;
             }
@@ -107,7 +113,7 @@ int radio_pulses_capture(int startOffset, int minPulseUs, int maxSpaceUs)
 int radio_pulses_send(int startOffset, int pulses)
 {
     int total_us = 0; 
-    uint32_t s;
+    uint64_t s;
     if (pulses > 0 && startOffset >=0 && startOffset < radio_pulses_buffer_len)
     { 
         RadioDev* radio = getRadio();        
@@ -135,9 +141,13 @@ int radio_pulses_send(int startOffset, int pulses)
                break;
            
             digitalWrite(gdo0, curr_val);
-            s = micros();
-            while (micros() -s < radio_pulses_buffer[idx]);
-            //delayMicroseconds(radio_pulses_buffer[idx]);
+            // time_us_64() (raw Pico SDK, reads the hardware timer directly)
+            // instead of Arduino's micros(): avoids the Arduino-core wrapper
+            // overhead and any cross-core contention with core1's own
+            // micros()-based busy-wait capture loop, for lower jitter in this
+            // precision-critical TX timing loop.
+            s = time_us_64();
+            while (time_us_64() - s < radio_pulses_buffer[idx]);
             curr_val++;
             curr_val &= 0x01;              
         }
@@ -234,8 +244,9 @@ static int radio_pulses_pack_bits(int startOffset, int pulses, int unitUs)
 // automatically around the transmit - the caller does not set it separately.
 // Returns the represented duration in microseconds (post-quantization) on
 // success, or a negative value on error: -1 bad args, -2 does not fit the
-// scratch buffer, -3 FIFO underrun/stall during transmit. Does not touch the
-// stored pulse buffer (same invariant as radio_pulses_send()).
+// scratch buffer, -3 FIFO underrun/stall during transmit, -4 the radio never
+// reached IDLE before transmit. Does not touch the stored pulse buffer (same
+// invariant as radio_pulses_send()).
 long radio_pulses_send_fifo(int startOffset, int pulses, int unitUs)
 {
    int nbytes = radio_pulses_pack_bits(startOffset, pulses, unitUs);
@@ -253,6 +264,14 @@ long radio_pulses_send_fifo(int startOffset, int pulses, int unitUs)
    // lasting change to the active profile's data rate.
    int savedDrate = radio->getDataRate();
    long targetBaud = (1000000L + (unitUs / 2)) / unitUs;   // round to nearest
+   // Per-board empirical correction (see RadioDev::fifoDrateCalPermille):
+   // on at least one real module, SDR measurement showed the actual on-air
+   // bit period running ~2x shorter than this naive value, even though the
+   // written MDMCFG3/MDMCFG4 bytes were independently verified correct
+   // against the TI datasheet DRATE formula - i.e. a hardware-specific
+   // quirk, not a bug in this calculation. Defaults to 1000 (no change).
+   long cal = radio->getFifoDrateCal();
+   targetBaud = (targetBaud * cal + 500) / 1000;   // round to nearest
    if (targetBaud < 20L)      targetBaud = 20L;             // RadioLib/CC1101 floor
    if (targetBaud > 1621830L) targetBaud = 1621830L;        // RadioLib/CC1101 ceiling
    radio->setDataRate((int)targetBaud);
@@ -272,7 +291,8 @@ long radio_pulses_send_fifo(int startOffset, int pulses, int unitUs)
    radio->setPacketFormat(0);
    radio->setRX();
 
-   if (st != 0) return -3;
+   if (st == -4) return -4;   // chip never reached IDLE - distinct from an underrun/stall
+   if (st != 0)  return -3;   // FIFO underrun/stall during transmit
 
    long total_us = 0;
    for (int idx = startOffset; idx < startOffset + pulses; idx++)

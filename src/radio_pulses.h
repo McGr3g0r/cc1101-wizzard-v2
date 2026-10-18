@@ -16,7 +16,12 @@ int radio_pulses_send(int startOffset, int pulses);
 // Hardware-clocked alternative to radio_pulses_send() via the TX FIFO instead
 // of GDO0 bit-banging - see the .ino for details and the quantization trade-off.
 // DRATE is derived from unitUs and applied/restored automatically; do not set
-// it separately beforehand.
+// it separately beforehand. If SDR measurement shows your board's actual
+// on-air bit period differs from unitUs by a consistent ratio, correct it
+// with 'radio r0 set fifocal <permille>' (RadioDev::fifoDrateCalPermille) -
+// e.g. 500 if the real period is running at ~2x the requested rate. Default
+// 1000 (no correction); never assumed, only set after measuring your own
+// board.
 long radio_pulses_send_fifo(int startOffset, int pulses, int unitUs);
 int radio_pulses_set(int startOffset, uint16_t pulse);
 int radio_pulses_add(uint16_t pulse);
