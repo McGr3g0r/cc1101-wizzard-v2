@@ -6,7 +6,7 @@
 //------------------------------------------------------------------------------------------------------------------
 // monitor command (v2) - raw capture only
 //
-//   monitor start <iface> <profile> [json|hex] [minUs] [maxGapUs]
+//   monitor start <iface> <profile> [json|hex] [minUs] [maxGapUs] [rssiGate] [direct]
 //   monitor stop
 //   monitor status
 //
@@ -16,11 +16,24 @@
 // Monitoring is NON-BLOCKING: monitor_poll() runs from loop(), so the CLI stays
 // responsive (type 'monitor stop' or any command at any time).
 //
-// Capture method depends on the modulation set by the profile:
-//   OOK (ASK)             -> pulse capture; emits the raw pulse-train (us timings)
-//   2-FSK/GFSK/4-FSK/MSK  -> packet mode; emits the raw RX-FIFO bytes
+// Capture method depends on the modulation set by the profile, and on the
+// 'direct' keyword:
+//   OOK (ASK)                    -> always direct/pulse capture (forced)
+//   2-FSK/GFSK/4-FSK/MSK, +'direct' -> ALSO direct/pulse capture
+//   2-FSK/GFSK/4-FSK/MSK, no 'direct'-> packet mode (default for these)
 //
-// OOK capture params (optional):
+// Direct mode is not actually OOK-specific: CC1101's async serial RX mode
+// puts whatever the demodulator decided (envelope slicer for OOK, frequency
+// slicer for FSK-family modes) onto GDO0 as a level, continuously, regardless
+// of modulation - so the exact same pulse-timing capture that serves OOK also
+// works for e.g. 2-FSK carrying a non-standard/AFSK-style bit framing the
+// chip's own packet engine (sync word, fixed/variable length, CRC) would not
+// decode correctly. Pass 'direct' as the last argument to use it:
+//   monitor start r0 fsk433 json 100 2000 -85 direct
+// In direct mode, the emitted "us" pulse-train format is identical to OOK's -
+// only "mod" in the output differs, reporting the real modulation in use.
+//
+// Direct-mode capture params (optional; same meaning regardless of modulation):
 //   minUs    - runt filter: leading/trailing edges shorter than this are
 //              dropped                                           (default 100)
 //   maxGapUs - guard / inter-frame gap: a continuous LOW this long marks a
@@ -60,6 +73,17 @@ void radio_profile_exec_line(void* ctx, const char* line);  // defined in radio_
 #define MON_OOK_DEF_MAXGAP 15000
 #define MON_OOK_RSSI_GATE  -85       // dBm: only capture when RSSI is above this (carrier present)
                                      // noise floor ~ -92..-99 dBm in testing; override per setup
+// Direct/async GDO0 capture (pulse-train timing, same mechanism as the OOK
+// path below) is not actually OOK-specific: CC1101's async serial RX mode
+// just puts whatever the demodulator decided (envelope slicer for OOK/ASK,
+// frequency slicer for 2-FSK/GFSK/4-FSK/MSK) onto GDO0 as a level, continuously,
+// regardless of modulation. For OOK this firmware always captures this way
+// (forced, below). For every other modulation it is opt-in via the 'direct'
+// keyword to 'monitor start' - e.g. for 2-FSK, this lets a host decode a
+// non-standard bit framing itself (AFSK-style) from raw symbol-timing, the
+// same way it would decode an unknown OOK remote from raw pulses, instead of
+// relying on CC1101's own packet engine (sync word, fixed/variable length,
+// CRC) which assumes a standard framing the signal may not actually have.
 //------------------------------------------------------------------------------------------------------------------
 static struct monitor_state_s
 {
@@ -67,9 +91,11 @@ static struct monitor_state_s
    radio_iface_t* iface;
    int            fmt;        // MON_FMT_*
    int            mod;        // modulation in effect
-   int            minUs;      // OOK: shortest pulse kept
-   int            maxGapUs;   // OOK: gap ending a frame
-   int            rssiGate;   // OOK: capture only when RSSI >= this (dBm)
+   bool           direct;     // true: async GDO0 pulse-timing capture (forced for OOK,
+                               // opt-in via 'direct' for other modulations); false: packet mode
+   int            minUs;      // direct mode: shortest pulse kept
+   int            maxGapUs;   // direct mode: gap ending a frame
+   int            rssiGate;   // direct mode: capture only when RSSI >= this (dBm)
    uint32_t       count;      // frames/packets emitted
    char           profile[RPROFILE_NAME_MAXLEN + 1];
 } mon;
@@ -102,7 +128,7 @@ cmd_handler_t monitor_handler = { &monitor_main, NULL, NULL, "monitor", "non-blo
 //------------------------------------------------------------------------------------------------------------------
 cmd_handler_t monitor_sub_cmd[] = {
    { &monitor_main,       &monitor_handler, NULL, "help",   "this help", 0, "", "monitor help" },
-   { &monitor_start_cmd,  &monitor_handler, NULL, "start",  "start <iface> <profile> [json|hex] [minUs] [maxGapUs] [rssiGate dBm]", 2, "tt", "monitor start r0 ook433 json" },
+   { &monitor_start_cmd,  &monitor_handler, NULL, "start",  "start <iface> <profile> [json|hex] [minUs] [maxGapUs] [rssiGate dBm] [direct]", 2, "tt", "monitor start r0 ook433 json" },
    { &monitor_stop_cmd,   &monitor_handler, NULL, "stop",   "stop monitoring", 0, "", "monitor stop" },
    { &monitor_status_cmd, &monitor_handler, NULL, "status", "show monitor state", 0, "", "monitor status" },
    { 0, 0, NULL, "", "", 0, "", "" }
@@ -149,9 +175,16 @@ CmdStatus_e monitor_start_cmd(void* parent, int argc, char* argv[])
       else if (!strcmp(argv[4], "hex"))  fmt = MON_FMT_HEX;
       else { h->setHint("format: json | hex"); return WRONG_PARAMS; }
    }
-   if (argc >= 6) minUs    = atoi(argv[5]);
-   if (argc >= 7) maxGapUs = atoi(argv[6]);
-   if (argc >= 8) rssiGate = atoi(argv[7]);   // dBm carrier-sense gate (OOK)
+   // 'direct' (forces async GDO0 pulse-timing capture for a non-OOK modulation
+   // - see the mon.direct comment above) is recognized as the last argument,
+   // wherever it falls, so it can follow either just <fmt> or the full
+   // <minUs> <maxGapUs> <rssiGate> - the numeric params keep their normal
+   // positions either way.
+   bool wantDirect = (argc >= 6 && !strcmp(argv[argc - 1], "direct"));
+   int numArgc = wantDirect ? argc - 1 : argc;   // numeric parsing ignores the trailing keyword
+   if (numArgc >= 6) minUs    = atoi(argv[5]);
+   if (numArgc >= 7) maxGapUs = atoi(argv[6]);
+   if (numArgc >= 8) rssiGate = atoi(argv[7]);   // dBm carrier-sense gate (direct mode)
    if (minUs < 1 || maxGapUs <= minUs) { h->setHint("need 0 < minUs < maxGapUs"); return WRONG_PARAMS; }
 
    // apply the profile (sets freq, modulation, bandwidth, data rate, rx, ...)
@@ -161,6 +194,7 @@ CmdStatus_e monitor_start_cmd(void* parent, int argc, char* argv[])
    mon.iface    = ifc;
    mon.fmt      = fmt;
    mon.mod      = ifc->radio->getModulation();
+   mon.direct   = (mon.mod == MOD_OOK) || wantDirect;
    mon.minUs    = minUs;
    mon.maxGapUs = maxGapUs;
    mon.rssiGate = rssiGate;
@@ -168,9 +202,10 @@ CmdStatus_e monitor_start_cmd(void* parent, int argc, char* argv[])
    memset(mon.profile, 0, sizeof(mon.profile));
    strncpy(mon.profile, pname, sizeof(mon.profile) - 1);
 
-   if (mon.mod == MOD_OOK)
+   if (mon.direct)
    {
-      // enter async direct RX ONCE (data on GDO0); core1 bit-bangs it
+      // enter async direct RX ONCE (data on GDO0); core1 bit-bangs it. Works
+      // the same regardless of modulation - see the mon.direct comment above.
       ifc->radio->setCCMode(0);
       ifc->radio->setPacketFormat(3);
       ifc->radio->setRX();
@@ -209,6 +244,7 @@ CmdStatus_e monitor_status_cmd(void* parent, int argc, char* argv[])
    STDOUT.print("monitor: active iface="); STDOUT.print(mon.iface->name);
    STDOUT.print(" profile="); STDOUT.print(mon.profile);
    STDOUT.print(" mod="); STDOUT.print(RadioDev::modulation(mon.mod));
+   STDOUT.print(" direct="); STDOUT.print(mon.direct ? 1 : 0);
    STDOUT.print(" fmt="); STDOUT.print(mon.fmt == MON_FMT_JSON ? "json" : "hex");
    STDOUT.print(" captures="); STDOUT.println(mon.count);
    return OK;
@@ -231,7 +267,9 @@ static void monitor_print_hex16(uint16_t v)
    STDOUT.print(t);
 }
 //------------------------------------------------------------------------------------------------------------------
-// OOK: dump the raw captured pulse-train (microsecond durations).
+// Direct mode (any modulation - forced for OOK, opt-in for others, see the
+// mon.direct comment above): dump the raw captured pulse-train (microsecond
+// level durations straight off GDO0).
 static void monitor_emit_pulses(RadioDev* r, uint16_t* pulses, int n)
 {
    uint32_t ts = millis();
@@ -242,7 +280,8 @@ static void monitor_emit_pulses(RadioDev* r, uint16_t* pulses, int n)
    {
       STDOUT.print("{ \"iface\":\""); STDOUT.print(mon.iface->name);
       STDOUT.print("\", \"ts\":"); STDOUT.print(ts);
-      STDOUT.print(", \"mod\":\"ook\", \"rssi\":"); STDOUT.print(rssi);
+      STDOUT.print(", \"mod\":\""); STDOUT.print(RadioDev::modulation(mon.mod));
+      STDOUT.print("\", \"rssi\":"); STDOUT.print(rssi);
       STDOUT.print(", \"lqi\":"); STDOUT.print(lqi);
       STDOUT.print(", \"n\":"); STDOUT.print(n);
       STDOUT.print(", \"us\":[");
@@ -256,7 +295,8 @@ static void monitor_emit_pulses(RadioDev* r, uint16_t* pulses, int n)
    else
    {
       STDOUT.print(mon.iface->name); STDOUT.print(" ts="); STDOUT.print(ts);
-      STDOUT.print(" ook rssi="); STDOUT.print(rssi); STDOUT.print(" lqi="); STDOUT.print(lqi);
+      STDOUT.print(" "); STDOUT.print(RadioDev::modulation(mon.mod));
+      STDOUT.print(" rssi="); STDOUT.print(rssi); STDOUT.print(" lqi="); STDOUT.print(lqi);
       STDOUT.print(" n="); STDOUT.print(n); STDOUT.print(" ");
       for (int i = 0; i < n; i++) monitor_print_hex16(pulses[i]);
       STDOUT.println();
@@ -304,7 +344,7 @@ void monitor_poll(void)
 
    RadioDev* r = mon.iface->radio;
 
-   if (mon.mod == MOD_OOK)
+   if (mon.direct)
    {
       // core0 side: never blocks. The actual capture happens on core1.
       static uint32_t lastCapMs = 0;
