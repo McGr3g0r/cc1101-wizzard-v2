@@ -110,6 +110,14 @@ static volatile bool mon_cap_done    = false;   // core1 -> core0: frame ready
 static volatile int  mon_cap_count   = 0;       // result pulse count
 static int           mon_cap_min     = 100;     // params (stable while running)
 static int           mon_cap_maxgap  = 15000;
+// RSSI at the moment capture was armed (core0-only; set then read within the
+// same core0 polling loop, no cross-core access). A carrier is guaranteed
+// present at THIS instant, since it is exactly what satisfied rssiGate to
+// trigger the arm - unlike a fresh getRSSI() taken after capture completes,
+// which lands in the trailing gap that, by definition, ended the frame (the
+// carrier is reliably OFF there), so it would read close to the noise floor
+// regardless of how strong the actual signal was.
+static int           mon_cap_rssi    = 0;
 //------------------------------------------------------------------------------------------------------------------
 // Runs on core1 (from loop1). Blocking capture here is fine - core0 is untouched.
 void monitor_core1_task(void)
@@ -273,7 +281,10 @@ static void monitor_print_hex16(uint16_t v)
 static void monitor_emit_pulses(RadioDev* r, uint16_t* pulses, int n)
 {
    uint32_t ts = millis();
-   int rssi = r->getRSSI();
+   // NOT a fresh r->getRSSI() here - see the mon_cap_rssi comment above: by
+   // the time capture is done, the carrier is reliably OFF (we are in the
+   // trailing gap that ended the frame), so a fresh read would be meaningless.
+   int rssi = mon_cap_rssi;
    int lqi  = r->getLQI();
 
    if (mon.fmt == MON_FMT_JSON)
@@ -366,7 +377,10 @@ void monitor_poll(void)
       {
          int rssi = r->getRSSI();
          if (rssi >= mon.rssiGate && (millis() - lastCapMs) >= 300)
+         {
+            mon_cap_rssi    = rssi;   // latch: see mon_cap_rssi comment above
             mon_cap_request = true;   // core1 picks this up and captures
+         }
       }
    }
    else
