@@ -9,11 +9,6 @@
 //   monitor start <iface> <profile> [json|hex] [minUs] [maxGapUs] [rssiGate] [direct]
 //   monitor stop
 //   monitor status
-//   monitor beginlog   - also append every emitted capture to monNNNN.txt on
-//                        LittleFS (NNNN = next free number; a fresh number each
-//                        beginlog). The file rotates to the next number once it
-//                        passes 32 KB, only between records (never mid-line).
-//   monitor endlog     - stop file logging ('monitor stop' also closes it)
 //
 // This firmware does NOT interpret protocols - it only captures and dumps raw
 // data. Decoding is left to the host connected over the CLI.
@@ -55,16 +50,11 @@
 #include "rprofile.h"
 #include "radio_pulses.h"
 #include "utils.h"
-#if USE_FILE_SYSTEM == 1
-#include "LittleFS.h"
-#endif
 //------------------------------------------------------------------------------------------------------------------
 CmdStatus_e monitor_main(void* parent, int argc, char* argv[]);
 CmdStatus_e monitor_start_cmd(void* parent, int argc, char* argv[]);
 CmdStatus_e monitor_stop_cmd(void* parent, int argc, char* argv[]);
 CmdStatus_e monitor_status_cmd(void* parent, int argc, char* argv[]);
-CmdStatus_e monitor_beginlog_cmd(void* parent, int argc, char* argv[]);
-CmdStatus_e monitor_endlog_cmd(void* parent, int argc, char* argv[]);
 CmdHandler* getRootCommandHandler(void);
 void radio_profile_exec_line(void* ctx, const char* line);  // defined in radio_handler.ino
 //------------------------------------------------------------------------------------------------------------------
@@ -149,8 +139,6 @@ cmd_handler_t monitor_sub_cmd[] = {
    { &monitor_start_cmd,  &monitor_handler, NULL, "start",  "start <iface> <profile> [json|hex] [minUs] [maxGapUs] [rssiGate dBm] [direct]", 2, "tt", "monitor start r0 ook433 json" },
    { &monitor_stop_cmd,   &monitor_handler, NULL, "stop",   "stop monitoring", 0, "", "monitor stop" },
    { &monitor_status_cmd, &monitor_handler, NULL, "status", "show monitor state", 0, "", "monitor status" },
-   { &monitor_beginlog_cmd, &monitor_handler, NULL, "beginlog", "also log captures to monNNNN.txt (new file each time; rotates at 32KB)", 0, "", "monitor beginlog" },
-   { &monitor_endlog_cmd,   &monitor_handler, NULL, "endlog",   "stop logging captures to file", 0, "", "monitor endlog" },
    { 0, 0, NULL, "", "", 0, "", "" }
 };
 //------------------------------------------------------------------------------------------------------------------
@@ -253,34 +241,8 @@ CmdStatus_e monitor_stop_cmd(void* parent, int argc, char* argv[])
    mon_cap_enabled = false;    // stop core1 capturing
    mon_cap_request = false;
    mon_cap_done    = false;
-   monitor_endlog();           // close any open log file
    if (mon.iface) mon.iface->radio->setIdle();
    STDOUT.print("monitor stopped, captures="); STDOUT.println(mon.count);
-   return OK;
-}
-//------------------------------------------------------------------------------------------------------------------
-CmdStatus_e monitor_beginlog_cmd(void* parent, int argc, char* argv[])
-{
-#if USE_FILE_SYSTEM == 1
-   if (!monitor_beginlog())
-   {
-      ((CmdHandler*)parent)->setHint("could not create log file");
-      return FILE_ERROR;
-   }
-   char name[16];
-   snprintf(name, sizeof(name), "mon%04d.txt", mon_log_num);
-   STDOUT.print("logging captures to "); STDOUT.println(name);
-   return OK;
-#else
-   ((CmdHandler*)parent)->setHint("file system disabled");
-   return FILE_ERROR;
-#endif
-}
-//------------------------------------------------------------------------------------------------------------------
-CmdStatus_e monitor_endlog_cmd(void* parent, int argc, char* argv[])
-{
-   monitor_endlog();
-   STDOUT.println("capture logging stopped");
    return OK;
 }
 //------------------------------------------------------------------------------------------------------------------
@@ -292,110 +254,25 @@ CmdStatus_e monitor_status_cmd(void* parent, int argc, char* argv[])
    STDOUT.print(" mod="); STDOUT.print(RadioDev::modulation(mon.mod));
    STDOUT.print(" direct="); STDOUT.print(mon.direct ? 1 : 0);
    STDOUT.print(" fmt="); STDOUT.print(mon.fmt == MON_FMT_JSON ? "json" : "hex");
-   STDOUT.print(" captures="); STDOUT.print(mon.count);
-   if (mon_logging)
-   {
-      char name[16];
-      snprintf(name, sizeof(name), "mon%04d.txt", mon_log_num);
-      STDOUT.print(" log="); STDOUT.print(name);
-   }
-   else
-   {
-      STDOUT.print(" log=off");
-   }
-   STDOUT.println();
+   STDOUT.print(" captures="); STDOUT.println(mon.count);
    return OK;
 }
 //------------------------------------------------------------------------------------------------------------------
-//------------------------------------------------------------------------------------------------------------------
-// Optional file logging: 'monitor beginlog' tees every emitted record into a
-// LittleFS file monNNNN.txt (NNNN zero-padded; the next free number, i.e.
-// highest existing +1, is chosen at each beginlog). The file is rotated to the
-// next number once it passes 32 KB, but only AFTER a full line is written, so a
-// record is never split across files. 'monitor endlog' (and 'monitor stop')
-// closes the file.
-//------------------------------------------------------------------------------------------------------------------
-#define MON_LOG_ROTATE_BYTES 32768
-#if USE_FILE_SYSTEM == 1
-static bool     mon_logging   = false;
-static File     mon_logfile;
-static uint32_t mon_log_bytes = 0;
-static int      mon_log_num   = 0;
-//------------------------------------------------------------------------------------------------------------------
-static int mon_log_next_num(void)
+static void monitor_print_hexbytes(uint8_t* buf, int len)
 {
-   int maxn = 0;
-   Dir dir = LittleFS.openDir("/");
-   while (dir.next())
+   for (int i = 0; i < len; i++)
    {
-      if (!dir.isFile()) continue;
-      String fn = dir.fileName();
-      if (fn.startsWith("/")) fn = fn.substring(1);
-      if (fn.startsWith("mon") && fn.endsWith(".txt"))
-      {
-         String mid = fn.substring(3, fn.length() - 4);   // between 'mon' and '.txt'
-         if (mid.length() == 0) continue;
-         bool digits = true;
-         for (unsigned i = 0; i < mid.length(); i++)
-            if (mid[i] < '0' || mid[i] > '9') { digits = false; break; }
-         if (digits) { int v = mid.toInt(); if (v > maxn) maxn = v; }
-      }
-   }
-   return maxn + 1;
-}
-//------------------------------------------------------------------------------------------------------------------
-static bool mon_log_open(int num)
-{
-   char path[20];
-   snprintf(path, sizeof(path), "/mon%04d.txt", num);
-   mon_logfile = LittleFS.open(path, "w");
-   if (!mon_logfile) return false;
-   mon_log_bytes = 0;
-   mon_log_num   = num;
-   return true;
-}
-//------------------------------------------------------------------------------------------------------------------
-static bool monitor_beginlog(void)
-{
-   if (mon_logging) { mon_logfile.close(); mon_logging = false; }   // each beginlog starts a fresh number
-   if (!mon_log_open(mon_log_next_num())) return false;
-   mon_logging = true;
-   return true;
-}
-//------------------------------------------------------------------------------------------------------------------
-static void monitor_endlog(void)
-{
-   if (mon_logging) { mon_logfile.close(); mon_logging = false; }
-}
-//------------------------------------------------------------------------------------------------------------------
-static void mon_log_append(const String& rec)
-{
-   if (!mon_logging || !mon_logfile) return;
-   mon_log_bytes += mon_logfile.print(rec);
-   mon_log_bytes += mon_logfile.print('\n');
-   mon_logfile.flush();
-   // rotate only here, after a full line is on disk -> never split a record
-   if (mon_log_bytes >= MON_LOG_ROTATE_BYTES)
-   {
-      mon_logfile.close();
-      mon_log_open(mon_log_next_num());   // current file now exists -> picks the next number
+      if (buf[i] < 0x10) STDOUT.print("0");
+      STDOUT.print(buf[i], HEX);
    }
 }
-#else
-static const bool mon_logging = false;
-static const int  mon_log_num = 0;
-static bool monitor_beginlog(void)        { return false; }
-static void monitor_endlog(void)          { }
-static void mon_log_append(const String&) { }
-#endif
 //------------------------------------------------------------------------------------------------------------------
-// Single exit point for every emitted record: to the console always, and to the
-// log file when logging is active.
-static void monitor_emit_record(const String& rec)
+static void monitor_print_hex16(uint16_t v)
 {
-   STDOUT.println(rec);
-   mon_log_append(rec);
-   mon.count++;
+   // big-endian, 4 hex digits
+   char t[5];
+   snprintf(t, sizeof(t), "%04x", (unsigned)v);
+   STDOUT.print(t);
 }
 //------------------------------------------------------------------------------------------------------------------
 // Direct mode (any modulation - forced for OOK, opt-in for others, see the
@@ -410,30 +287,32 @@ static void monitor_emit_pulses(RadioDev* r, uint16_t* pulses, int n)
    int rssi = mon_cap_rssi;
    int lqi  = r->getLQI();
 
-   String rec;
-   rec.reserve((size_t)n * 6 + 96);   // avoid O(n^2) String growth for big frames
    if (mon.fmt == MON_FMT_JSON)
    {
-      rec += "{ \"iface\":\""; rec += mon.iface->name;
-      rec += "\", \"ts\":"; rec += (unsigned long)ts;
-      rec += ", \"mod\":\""; rec += RadioDev::modulation(mon.mod);
-      rec += "\", \"rssi\":"; rec += rssi;
-      rec += ", \"lqi\":"; rec += lqi;
-      rec += ", \"n\":"; rec += n;
-      rec += ", \"us\":[";
-      for (int i = 0; i < n; i++) { rec += (unsigned)pulses[i]; if (i < n - 1) rec += ','; }
-      rec += "] }";
+      STDOUT.print("{ \"iface\":\""); STDOUT.print(mon.iface->name);
+      STDOUT.print("\", \"ts\":"); STDOUT.print(ts);
+      STDOUT.print(", \"mod\":\""); STDOUT.print(RadioDev::modulation(mon.mod));
+      STDOUT.print("\", \"rssi\":"); STDOUT.print(rssi);
+      STDOUT.print(", \"lqi\":"); STDOUT.print(lqi);
+      STDOUT.print(", \"n\":"); STDOUT.print(n);
+      STDOUT.print(", \"us\":[");
+      for (int i = 0; i < n; i++)
+      {
+         STDOUT.print(pulses[i]);
+         if (i < n - 1) STDOUT.print(",");
+      }
+      STDOUT.println("] }");
    }
    else
    {
-      char hx[6];
-      rec += mon.iface->name; rec += " ts="; rec += (unsigned long)ts;
-      rec += ' '; rec += RadioDev::modulation(mon.mod);
-      rec += " rssi="; rec += rssi; rec += " lqi="; rec += lqi;
-      rec += " n="; rec += n; rec += ' ';
-      for (int i = 0; i < n; i++) { snprintf(hx, sizeof(hx), "%04x", (unsigned)pulses[i]); rec += hx; }
+      STDOUT.print(mon.iface->name); STDOUT.print(" ts="); STDOUT.print(ts);
+      STDOUT.print(" "); STDOUT.print(RadioDev::modulation(mon.mod));
+      STDOUT.print(" rssi="); STDOUT.print(rssi); STDOUT.print(" lqi="); STDOUT.print(lqi);
+      STDOUT.print(" n="); STDOUT.print(n); STDOUT.print(" ");
+      for (int i = 0; i < n; i++) monitor_print_hex16(pulses[i]);
+      STDOUT.println();
    }
-   monitor_emit_record(rec);
+   mon.count++;
 }
 //------------------------------------------------------------------------------------------------------------------
 // FSK/GFSK/4-FSK/MSK: dump the raw RX-FIFO bytes.
@@ -444,32 +323,28 @@ static void monitor_emit_pkt(RadioDev* r, uint8_t* buf, int len)
    int lqi  = r->getLQI();
    bool crc = r->crcOk();
 
-   String rec;
-   rec.reserve((size_t)len * 2 + 128);
-   char hx[3];
    if (mon.fmt == MON_FMT_JSON)
    {
-      rec += "{ \"iface\":\""; rec += mon.iface->name;
-      rec += "\", \"ts\":"; rec += (unsigned long)ts;
-      rec += ", \"mod\":\""; rec += RadioDev::modulation(mon.mod);
-      rec += "\", \"rssi\":"; rec += rssi;
-      rec += ", \"lqi\":"; rec += lqi;
-      rec += ", \"crc\":"; rec += (crc ? "true" : "false");
-      rec += ", \"len\":"; rec += len;
-      rec += ", \"hex\":\"";
-      for (int i = 0; i < len; i++) { snprintf(hx, sizeof(hx), "%02X", buf[i]); rec += hx; }
-      rec += "\" }";
+      STDOUT.print("{ \"iface\":\""); STDOUT.print(mon.iface->name);
+      STDOUT.print("\", \"ts\":"); STDOUT.print(ts);
+      STDOUT.print(", \"mod\":\""); STDOUT.print(RadioDev::modulation(mon.mod));
+      STDOUT.print("\", \"rssi\":"); STDOUT.print(rssi);
+      STDOUT.print(", \"lqi\":"); STDOUT.print(lqi);
+      STDOUT.print(", \"crc\":"); STDOUT.print(crc ? "true" : "false");
+      STDOUT.print(", \"len\":"); STDOUT.print(len);
+      STDOUT.print(", \"hex\":\""); monitor_print_hexbytes(buf, len); STDOUT.println("\" }");
    }
    else
    {
-      rec += mon.iface->name; rec += " ts="; rec += (unsigned long)ts;
-      rec += ' '; rec += RadioDev::modulation(mon.mod);
-      rec += " rssi="; rec += rssi; rec += " lqi="; rec += lqi;
-      rec += " crc="; rec += (crc ? 1 : 0);
-      rec += " len="; rec += len; rec += ' ';
-      for (int i = 0; i < len; i++) { snprintf(hx, sizeof(hx), "%02X", buf[i]); rec += hx; }
+      STDOUT.print(mon.iface->name); STDOUT.print(" ts="); STDOUT.print(ts);
+      STDOUT.print(" "); STDOUT.print(RadioDev::modulation(mon.mod));
+      STDOUT.print(" rssi="); STDOUT.print(rssi); STDOUT.print(" lqi="); STDOUT.print(lqi);
+      STDOUT.print(" crc="); STDOUT.print(crc ? 1 : 0);
+      STDOUT.print(" len="); STDOUT.print(len); STDOUT.print(" ");
+      monitor_print_hexbytes(buf, len);
+      STDOUT.println();
    }
-   monitor_emit_record(rec);
+   mon.count++;
 }
 //------------------------------------------------------------------------------------------------------------------
 // Called every loop() iteration. Does at most one capture/read, then returns so
