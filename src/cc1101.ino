@@ -2,7 +2,7 @@
 // Author: Grzegorz Rajtar
 // e-mail: mcgregor@blackmesaeast.com.pl
 // (c) 2026
-// Modified: 2026-10-18
+// Modified: 2026-10-20
 //------------------------------------------------------------------------------------------------------------------
 // RadioDev wrapper - RadioLib backend.
 //
@@ -192,6 +192,8 @@ void RadioDev::armOokTx(void)
    // RadioLib path only set PATABLE once at init, so it is re-armed here.
    if (mod == 2) rl_arm_ook_tx(pa);
 }
+//------------------------------------------------------------------------------------------------------------------
+bool RadioDev::waitTxReady(uint32_t timeoutUs) { return rl_wait_tx_ready(timeoutUs); }
 //------------------------------------------------------------------------------------------------------------------
 void RadioDev::sendData(uint8_t* data, int len)
 {

@@ -2,7 +2,7 @@
 // Author: Grzegorz Rajtar
 // e-mail: mcgregor@blackmesaeast.com.pl
 // (c) 2026
-// Modified: 2026-10-18
+// Modified: 2026-10-20
 //------------------------------------------------------------------------------------------------------------------
 #ifndef __CC1101_H__
 #define __CC1101_H__
@@ -96,6 +96,11 @@ class RadioDev {
         // right before a GDO0-driven direct transmit. No-op unless modulation is
         // OOK. Call after setCCMode(0)/setPacketFormat(3) and before setTX().
         void armOokTx(void);
+
+        // After setTX() in direct (GDO0) mode: block until the chip is really
+        // in TX (synthesizer calibration done, PA keyed by GDO0), bounded by
+        // timeoutUs. Returns false on timeout.
+        bool waitTxReady(uint32_t timeoutUs);
 
         static String modulation(int mod);
 

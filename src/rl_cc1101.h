@@ -2,7 +2,7 @@
 // Author: Grzegorz Rajtar
 // e-mail: mcgregor@blackmesaeast.com.pl
 // (c) 2026
-// Modified: 2026-10-18
+// Modified: 2026-10-20
 //------------------------------------------------------------------------------------------------------------------
 #ifndef __RL_CC1101_H__
 #define __RL_CC1101_H__
@@ -84,6 +84,11 @@ int   rl_get_lqi(void);
 void rl_set_rx_packet(void);   // normal packet RX (arms the "packet received" interrupt)
 void rl_set_rx_direct(void);   // async direct RX, raw data on GDO0 (for OOK pulse capture)
 void rl_set_tx_direct(void);   // async direct TX, data driven on GDO0
+// Wait (bounded by timeoutUs) until MARCSTATE reports TX, i.e. the frequency
+// synthesizer calibration triggered by STX (FS_AUTOCAL = IDLE->RX/TX, ~800us)
+// has finished and the PA is actually keyed by GDO0. Returns true if TX was
+// reached, false on timeout.
+bool rl_wait_tx_ready(uint32_t timeoutUs);
 void rl_idle(void);            // standby
 //------------------------------------------------------------------------------------------------------------------
 // data

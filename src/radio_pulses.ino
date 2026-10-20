@@ -2,12 +2,15 @@
 // Author: Grzegorz Rajtar
 // e-mail: mcgregor@blackmesaeast.com.pl
 // (c) 2026
-// Modified: 2026-10-18
+// Modified: 2026-10-20
 //------------------------------------------------------------------------------------------------------------------
 #include "radio_pulses.h"
 #include "radio_buffer.h"
 #include "settings.h"
 #include "cc1101.h"
+#include <hardware/gpio.h>
+#include <hardware/sync.h>
+#include <hardware/timer.h>
 //------------------------------------------------------------------------------------------------------------------
 RadioDev* getRadio(void);
 //------------------------------------------------------------------------------------------------------------------
@@ -25,7 +28,9 @@ void radio_pulses_init(void)
 void radio_pulses_flush(void)
 {
    radio_pulses_cnt = 0;
-   memset(radio_pulses_buffer, 0, sizeof(radio_pulses_buffer)); 
+   // clear the whole pulse buffer: radio_pulses_buffer is a pointer, so
+   // sizeof() on it would only cover the pointer itself (4 bytes)
+   memset(radio_pulses_buffer, 0, (size_t)radio_pulses_buffer_len * sizeof(radio_pulses_buffer[0]));
 }
 //------------------------------------------------------------------------------------------------------------------
 int radio_pulses_get_count(void)
@@ -74,7 +79,7 @@ int radio_pulses_capture(int startOffset, int minPulseUs, int maxSpaceUs)
 
     // time_us_64() (raw Pico SDK, reads the hardware timer directly) instead
     // of Arduino's micros(): avoids the Arduino-core wrapper overhead and any
-    // cross-core contention with core0's own time_us_64()-based TX busy-wait
+    // cross-core contention with core0's own hardware-timer-based TX loop
     // (see radio_pulses_send()), for lower jitter in this precision-critical
     // capture loop - consistent across the whole TX/RX timing path.
     uint64_t grabStart = time_us_64();
@@ -115,15 +120,72 @@ int radio_pulses_capture(int startOffset, int minPulseUs, int maxSpaceUs)
     return idx - startOffset;
 }
 //------------------------------------------------------------------------------------------------------------------
+// GDO0 direct-TX timing constants.
+//
+// In asynchronous serial mode the CC1101 modulator does NOT follow GDO0
+// continuously: it samples the pin at 8x the programmed data rate (DRATE) and
+// every edge is snapped to that grid. With a profile DRATE of e.g. 2400 Bd the
+// grid is ~52us, at 9600 Bd ~13us - each pulse can come out up to one grid step
+// shorter (or longer) than requested, no matter how precise the MCU loop is.
+// During a GDO0 transmit DRATE is therefore raised to at least this value
+// (grid = 1 / (8 * 250 kBd) = 0.5us) and restored afterwards, so the profile
+// data rate stays what it was for RX / packet mode.
+#define RADIO_PULSES_TX_DRATE            250000L
+// Upper bound for waiting until the chip is in TX after STX (the FS_AUTOCAL
+// calibration RadioLib configures takes ~800us). Generous on purpose.
+#define RADIO_PULSES_TX_READY_TIMEOUT_US 5000
+// Trains up to this length are sent with interrupts disabled on this core, so
+// no ISR (USB, timers) can stretch one pulse and - with absolute deadlines -
+// shorten the next one. Longer trains run with interrupts enabled to keep USB
+// serviced; their per-edge jitter is then bounded by the ISR latency.
+#define RADIO_PULSES_TX_IRQ_OFF_MAX_US   500000L
+//------------------------------------------------------------------------------------------------------------------
+// The actual pulse train, executed from RAM (no XIP cache-miss stalls), with
+// direct SIO access (gpio_put) instead of digitalWrite(), and with ABSOLUTE
+// deadlines: edge k is placed at t0 + sum(p[0..k-1]). The previous loop
+// restarted its time base after every digitalWrite(), so each pulse was
+// lengthened by the write/loop overhead and that error accumulated over the
+// frame. time_us_32() is a single read of the hardware timer register; the
+// signed difference below is wrap-safe.
+// Placed in RAM via the same .time_critical section the Pico SDK's
+// __not_in_flash_func() uses (written out as a plain attribute so the .ino
+// prototype generator sees an ordinary function definition).
+static void __attribute__((noinline, section(".time_critical.radio_pulses_tx_train"))) radio_pulses_tx_train(const uint16_t* p, int n, uint pin)
+{
+    uint32_t level = 1;
+    uint32_t t = time_us_32();
+    for (int i = 0; i < n; i++)
+    {
+        gpio_put(pin, level);
+        t += p[i];
+        while ((int32_t)(time_us_32() - t) < 0) { }
+        level ^= 1u;
+    }
+    gpio_put(pin, 0);
+}
+//------------------------------------------------------------------------------------------------------------------
 int radio_pulses_send(int startOffset, int pulses)
 {
-    int total_us = 0; 
-    uint64_t s;
-    if (pulses > 0 && startOffset >=0 && startOffset < radio_pulses_buffer_len)
-    { 
-        RadioDev* radio = getRadio();        
-        radio->setCCMode(0); 
+    int total_us = 0;
+    if (pulses > 0 && startOffset >= 0 && startOffset < radio_pulses_buffer_len)
+    {
+        if (startOffset + pulses > radio_pulses_buffer_len)
+            pulses = radio_pulses_buffer_len - startOffset;
+
+        for (int idx = startOffset; idx < startOffset + pulses; idx++)
+            total_us += radio_pulses_buffer[idx];
+
+        RadioDev* radio = getRadio();
+        int savedDrate = radio->getDataRate();
+        bool raiseDrate = (savedDrate < RADIO_PULSES_TX_DRATE);
+
+        radio->setCCMode(0);
         radio->setPacketFormat(3);
+        // Fine GDO0 sampling grid for the duration of the transmit (see
+        // RADIO_PULSES_TX_DRATE). setDataRate() strobes IDLE, so it must come
+        // before armOokTx()/setTX().
+        if (raiseDrate)
+            radio->setDataRate((int)RADIO_PULSES_TX_DRATE);
         // Re-arm the OOK PA table (FREND0=0x11, PATABLE={0x00, power}) so the
         // carrier is fully off between marks. Without this, RadioLib's init-time
         // table was relied on and the "space" level could leak carrier, which
@@ -132,45 +194,41 @@ int radio_pulses_send(int startOffset, int pulses)
         radio->armOokTx();
         radio->setTX();
 
+        // Hold the line at "space" while the synthesizer calibrates. STX from
+        // IDLE triggers FS calibration (~800us); edges driven before MARCSTATE
+        // reaches TX are not transmitted, so the first pulse(s) of the frame
+        // used to come out shortened or not at all.
         pinMode(gdo0, OUTPUT);
+        gpio_put(gdo0, 0);
+        radio->waitTxReady(RADIO_PULSES_TX_READY_TIMEOUT_US);
+
         if (radio_pulses_buffer[startOffset] == 0xffff) /*hack*/
         {
-            digitalWrite(gdo0, LOW);
             delayMicroseconds(1000);
         }
-        
+
         digitalWrite(RXLED, LOW);   // set the RX LED ON
-        uint8_t curr_val = 1;
-        for (int idx = startOffset; idx < startOffset + pulses; idx++) {
-           if (idx >= radio_pulses_buffer_len)
-               break;
-           
-            digitalWrite(gdo0, curr_val);
-            // time_us_64() (raw Pico SDK, reads the hardware timer directly)
-            // instead of Arduino's micros(): avoids the Arduino-core wrapper
-            // overhead and any cross-core contention with core1's own
-            // micros()-based busy-wait capture loop, for lower jitter in this
-            // precision-critical TX timing loop.
-            s = time_us_64();
-            while (time_us_64() - s < radio_pulses_buffer[idx]);
-            curr_val++;
-            curr_val &= 0x01;              
+
+        if ((long)total_us <= RADIO_PULSES_TX_IRQ_OFF_MAX_US)
+        {
+            uint32_t irq = save_and_disable_interrupts();
+            radio_pulses_tx_train(&radio_pulses_buffer[startOffset], pulses, gdo0);
+            restore_interrupts(irq);
         }
-            
-        digitalWrite(gdo0, 0);
+        else
+        {
+            radio_pulses_tx_train(&radio_pulses_buffer[startOffset], pulses, gdo0);
+        }
+
         digitalWrite(RXLED, HIGH);   // set the RX LED OFF
 
-        // setting normal pkt format again
-        radio->setCCMode(1); 
+        // restore the profile data rate, then the normal packet format / RX
+        if (raiseDrate)
+            radio->setDataRate(savedDrate);
+        radio->setCCMode(1);
         radio->setPacketFormat(0);
         radio->setRX();
 
-        for (int idx = startOffset; idx < startOffset + pulses; idx++) {
-           if (idx >= radio_pulses_buffer_len)
-               break;
-
-            total_us += radio_pulses_buffer[idx];
-        }
         // NOTE: transmitting must NOT change the stored buffer length; the
         // captured frame (and its count) stays intact so it can be replayed.
     }

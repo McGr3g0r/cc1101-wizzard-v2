@@ -36,6 +36,8 @@ void monitor_core1_task(void);
 void env_cmd_init(void);
 void radio_iface_init(void);
 void rprofile_cmd_init(void);
+void script_cmd_init(void);
+void script_run_init(void);   // execute /init.scr before the loop (script_handler.ino)
 #if USE_FILE_SYSTEM == 1
 void files_cmd_init(void);
 #endif
@@ -51,6 +53,7 @@ void commands_init(void)
   info_cmd_init();
   radio_cmd_init();
   rprofile_cmd_init();
+  script_cmd_init();
   monitor_cmd_init();
   #if USE_FILE_SYSTEM == 1
   files_cmd_init();
@@ -58,13 +61,41 @@ void commands_init(void)
   env_cmd_init();
 }
 //------------------------------------------------------------------------------------------------------------------
-RadioDev* getRadio() 
+RadioDev* getRadio()
 {
   return &cc;
 }
 //------------------------------------------------------------------------------------------------------------------
+Script* getScript(void)
+{
+  return &script;
+}
+//------------------------------------------------------------------------------------------------------------------
+// Parse and execute a single CLI line, then print OK / result / error - exactly
+// as loop() does for serial input. Used to run script lines (see script_handler).
+void cli_exec_line(const char* line)
+{
+  if (line == 0 || *line == 0) return;
+  if (parser.parse(String(line)))
+  {
+    bool cmdOk = handler.handleCommand(parser.getArgc(), parser.getArgv());
+    if (!cmdOk)
+    {
+      handler.print_error(Serial);
+    }
+    else if (handler.getResultMessage().length() > 0)
+    {
+      Serial.println(handler.getResultMessage());
+      handler.setResultMessage("");
+    }
+    else
+    {
+      Serial.println("OK");
+    }
+  }
+}
+//------------------------------------------------------------------------------------------------------------------
 void setup() {
-     String tmp;
      String verStr = String("CC1101 Wizard tool v")+ String(FW_VER_HI) + String(".") + String(FW_VER_LO) + String(" connected, use 'help' for list of commands...\n\r");
      uint32_t s = millis();
      Serial.begin(115200);
@@ -98,13 +129,11 @@ void setup() {
 
      #if USE_FILE_SYSTEM == 1
      env_load();
-     tmp = env_get("init", "none");
-     if (tmp == "none")
-         script.load("/init.scr");
-     else
-         script.load(String("/"+ tmp).c_str());
+     // Run the startup script (/init.scr, or the file named by the 'init' env
+     // var) synchronously here, BEFORE the serial/USB loop begins.
+     script_run_init();
      #endif
-     
+
 }
 //------------------------------------------------------------------------------------------------------------------
 void loop() {

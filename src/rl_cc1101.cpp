@@ -2,7 +2,7 @@
 // Author: Grzegorz Rajtar
 // e-mail: mcgregor@blackmesaeast.com.pl
 // (c) 2026
-// Modified: 2026-10-18
+// Modified: 2026-10-20
 //------------------------------------------------------------------------------------------------------------------
 // RadioLib shim - the ONLY translation unit that includes RadioLib. See rl_cc1101.h.
 //------------------------------------------------------------------------------------------------------------------
@@ -302,6 +302,22 @@ void rl_set_tx_direct(void)
    s_radio->transmitDirectAsync();   // async, GDO0 driven by the MCU
 }
 //------------------------------------------------------------------------------------------------------------------
+static uint8_t rl_marcstate(void)
+{
+   return (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_MARCSTATE, 4, 0);
+}
+//------------------------------------------------------------------------------------------------------------------
+bool rl_wait_tx_ready(uint32_t timeoutUs)
+{
+   if (!s_radio) return false;
+   uint32_t start = micros();
+   while (rl_marcstate() != RADIOLIB_CC1101_MARC_STATE_TX)
+   {
+      if ((uint32_t)(micros() - start) > timeoutUs) return false;
+   }
+   return true;
+}
+//------------------------------------------------------------------------------------------------------------------
 void rl_idle(void) { if (s_radio) s_radio->standby(); }
 //------------------------------------------------------------------------------------------------------------------
 bool rl_rx_available(void) { return s_rxFlag; }
@@ -430,8 +446,7 @@ int rl_transmit_raw_bits(const uint8_t* data, size_t nbytes)
    if (ret == 0)
    {
       // Infinite-length mode never ends the packet by itself: wait for the
-      // FIFO to actually drain to the modulator before leaving TX, or the
-      // last few bits get cut off when we strobe IDLE.
+      // FIFO to actually drain to the modulator before leaving TX.
       start = millis();
       while (rl_read_txbytes() != 0)
       {
@@ -439,7 +454,30 @@ int rl_transmit_raw_bits(const uint8_t* data, size_t nbytes)
       }
    }
 
+   if (ret == 0)
+   {
+      // TXBYTES == 0 only means the LAST byte has been moved from the FIFO
+      // into the modulator's shift register - its 8 bits are still being
+      // clocked out. Strobing IDLE at this point truncates the tail of the
+      // frame (up to 8 bit periods = 8 * unitUs, i.e. the last pulse(s) come
+      // out shorter or are lost). In infinite-length mode the chip enters
+      // TXFIFO_UNDERFLOW exactly when the shift register needs a new byte and
+      // the FIFO is empty, i.e. right after the final bit has left - so that
+      // state is the precise "everything is on air" marker.
+      start = millis();
+      while (rl_marcstate() != RADIOLIB_CC1101_MARC_STATE_TXFIFO_UNDERFLOW)
+      {
+         if (millis() - start > 2000) { ret = -2; break; }
+      }
+   }
+
+   // SFTX is the documented way out of TXFIFO_UNDERFLOW. It is only valid in
+   // IDLE or TXFIFO_UNDERFLOW, so it is issued before SIDLE only when the
+   // underflow state was actually reached; after standby() (IDLE) it is
+   // always valid and leaves an empty FIFO for the next transmit.
+   if (ret == 0) rl_strobe(RADIOLIB_CC1101_CMD_FLUSH_TX);
    s_radio->standby();
+   rl_strobe(RADIOLIB_CC1101_CMD_FLUSH_TX);
    s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_PKTCTRL0, savedPktctrl0);
    s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_MDMCFG2, savedMdmcfg2);
 
