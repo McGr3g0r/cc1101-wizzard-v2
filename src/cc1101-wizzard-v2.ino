@@ -96,7 +96,10 @@ void cli_exec_line(const char* line)
 }
 //------------------------------------------------------------------------------------------------------------------
 void setup() {
-     String verStr = String("CC1101 Wizard tool v")+ String(FW_VER_HI) + String(".") + String(FW_VER_LO) + String(" connected, use 'help' for list of commands...\n\r");
+     String verStr = String("CC1101 Wizard tool v") + String(FW_VER_HI) + String(".") + String(FW_VER_LO)
+                   + String(" build ") + String(FW_BUILD_NO)
+                   + String(" (built ") + String(__DATE__) + String(" ") + String(__TIME__) + String(")")
+                   + String(" connected, use 'help' for list of commands...\n\r");
      uint32_t s = millis();
      Serial.begin(115200);
 
@@ -104,7 +107,7 @@ void setup() {
      delay(1000);
      
      Serial.println(verStr.c_str());
-     Serial.println(F("(C) Grzegorz Rajtar grzegorz.rajtar@gmail.com 2023\n\r"));
+     Serial.println(F("(C) Grzegorz Rajtar grzegorz.rajtar@gmail.com 2026\n\r"));
      Serial.print(F("Plarform:"));Serial.println(platform_get_name());
      Serial.println();
 
