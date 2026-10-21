@@ -3,8 +3,13 @@
 A serial-CLI tool for the TI **CC1101** sub-GHz radio, running on an **RP2040**
 (Raspberry Pi Pico) under the Arduino framework. It lets a host (a terminal or
 an application such as an Android app) drive the radio over a simple text
-protocol: set any CC1101 register/parameter, store named work profiles, monitor
-incoming frames non-blocking, and transmit raw packets or OOK pulse trains.
+protocol: set any CC1101 register/parameter, store named work profiles, run
+stored/startup scripts, monitor incoming frames non-blocking, and transmit raw
+packets or OOK pulse trains.
+
+The boot banner reports the firmware version, build number and build timestamp
+(e.g. `CC1101 Wizard tool v2.1 build 33 (built Oct 21 2026 11:35:12) ...`); the
+same identity is available machine-readable via `info`.
 
 The firmware does **not** interpret protocols. The monitor emits only the raw
 captured data (hex or JSON); decoding/encoding is the host's job.
@@ -155,6 +160,36 @@ profile del  <name>
 profile apply <name> <iface>          run the profile's commands on an interface
 ```
 
+### script (stored scripts on LittleFS)
+
+A script is a plain-text file `<name>.scr` on LittleFS; each line is a CLI
+command, run in order. `/init.scr` (or the file named by the `init` env
+variable) is executed automatically at boot, **before** the serial/USB loop
+starts - handy to auto-configure the radio or apply a profile on power-up.
+Blank lines and lines starting with `#` are skipped; while a script runs, each
+line is echoed prefixed with `init> `.
+
+```
+script list                      list stored scripts
+script show   <name>             print a script's lines
+script new    <name>             create / clear an empty script
+script add    <name> <command>   append a CLI command line, e.g. script add init profile apply ook433 r0
+script del    <name>             delete a script
+script rename <old> <new>        rename a script
+script run    <name>             execute a script now
+```
+
+Script names use letters, digits, `_` and `-`, up to 24 characters; lines up to
+256 characters. Example - make the radio come up on an OOK profile every boot:
+```
+profile new ook433
+profile add ook433 set_freq 433920000
+profile add ook433 set mod ook
+script new init
+script add init profile apply ook433 r0
+# (reboot) -> init.scr runs 'profile apply ook433 r0' before the CLI starts
+```
+
 ### monitor (non-blocking RX)
 
 ```
@@ -214,7 +249,7 @@ truncation or parser rejection. Buffers that join a whole line
 
 ```
 src/
-  cc1101-wizzard-v2.ino   main sketch: setup/loop, core1 hook (loop1), command registration
+  cc1101-wizzard-v2.ino   main sketch: setup/loop, core1 hook (loop1), command registration, init.scr at boot
   cc1101.{h,ino}          RadioDev radio wrapper (driver-agnostic public API)
   rl_cc1101.{h,cpp}       RadioLib shim (the only RadioLib TU), flat rl_* API
   radio_handler.ino       'radio' command dispatcher
@@ -224,6 +259,7 @@ src/
   radio_raw.{h,ino}       raw packet TX helper
   Monitor.ino             non-blocking RX monitor (packet + OOK/core1)
   rprofile.{h,ino}        LittleFS-backed named profiles + 'profile' command
+  script_handler.ino      LittleFS .scr scripts + 'script' command, init.scr runner
   info_handler.ino        'info' command (device/fw identification)
   platform_rp2040.ino     SPI0 bring-up, platform name, RX LED
   settings.h              pins, buffer sizes, firmware identity, feature flags
@@ -233,8 +269,9 @@ src/
 ## Status
 
 Built with PlatformIO and tested on RP2040 hardware: chip detection, `info`,
-parameters, profiles, the non-blocking OOK monitor (live CLI, real frames
-captured on core1), and OOK pulse replay all work. Packet-mode (FSK) monitor
-and TX paths are implemented - exercise them against your own signals. If the
+parameters, profiles, LittleFS scripts (incl. `init.scr` at boot), the
+non-blocking OOK monitor (live CLI, real frames captured on core1), and OOK
+pulse replay all work. Packet-mode (FSK) monitor and TX paths are implemented -
+exercise them against your own signals. If the
 chip is not detected, `info text` shows `chip_version` (a genuine CC1101
 reports 20 / 0x14).
