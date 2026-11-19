@@ -91,6 +91,18 @@ void rl_set_tx_direct(void);   // async direct TX, data driven on GDO0
 bool rl_wait_tx_ready(uint32_t timeoutUs);
 void rl_idle(void);            // standby
 //------------------------------------------------------------------------------------------------------------------
+// spectrum paint (see radio_paint.*): single-carrier frequency "painting".
+// rl_paint_cal() calibrates one frequency and reads back its FREQ2/1/0 +
+// FSCAL3/2/1 (6 bytes) so it can be restored later without recalibrating.
+// rl_paint_begin() puts the chip in async direct TX with FS_AUTOCAL=never;
+// rl_paint_hop() reloads a stored 6-byte register set and re-keys TX (just the
+// synth settling, ~75us, no ~800us recal); rl_paint_end() restores normal
+// auto-calibration and idles. The carrier itself is keyed by GDO0 (OOK mark).
+void rl_paint_cal(float mhz, uint8_t out6[6]);
+void rl_paint_begin(void);
+void rl_paint_hop(const uint8_t regs6[6]);
+void rl_paint_end(void);
+//------------------------------------------------------------------------------------------------------------------
 // data
 bool rl_rx_available(void);                              // packet waiting?
 int  rl_receive(uint8_t* buf, int maxlen, int* crcOk);   // read packet, returns length

@@ -102,6 +102,16 @@ class RadioDev {
         // timeoutUs. Returns false on timeout.
         bool waitTxReady(uint32_t timeoutUs);
 
+        // Spectrum paint (see radio_paint.*). paintCal() calibrates one
+        // frequency (MHz) and reads back its FREQ+FSCAL registers (6 bytes).
+        // paintBegin()/paintHop()/paintEnd() do fast carrier hopping without
+        // per-hop recalibration; the carrier is keyed by holding GDO0 high
+        // (OOK mark), so call armOokTx() first and set modulation to OOK.
+        void paintCal(float mhz, uint8_t out6[6]);
+        void paintBegin(void);
+        void paintHop(const uint8_t regs6[6]);
+        void paintEnd(void);
+
         static String modulation(int mod);
 
         void setCCMode(int mode);

@@ -1,0 +1,4 @@
+# Dependencias de png2paint.py (envía un PNG a la feature 'paint' del CC1101)
+# Instalar con:  pip install -r tools/requirements.txt
+Pillow>=10.0.0      # carga/escala/umbraliza la imagen (módulo PIL)
+pyserial>=3.5       # comunicación serie con el dispositivo (/dev/ttyACM0)

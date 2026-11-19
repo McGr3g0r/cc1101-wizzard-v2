@@ -106,6 +106,7 @@ radio <iface> scan <startKHz> <stopKHz>
 radio <iface> send <hexstring>
 radio <iface> jam <ms>             (0 = until ctrl-c)
 radio <iface> pulses ...           (see "pulses" below)
+radio <iface> paint ...            (see "paint" below)
 ```
 
 Only `r0` exists for now (one CC1101 on SPI0). Frequencies are in Hz for
@@ -145,6 +146,63 @@ total time short enough for the host's read timeout.
 
 To load large pulse trains, send several `pulses add` lines (up to ~58 values
 per line given the 255-char / 64-token line limits) and then `pulses play`.
+
+### paint (spectrum painting)
+
+Draws an image on an SDR **waterfall** by hopping the carrier: horizontal axis =
+**frequency**, vertical axis = **time**, brightness = carrier on/off. The CC1101
+is a single narrowband carrier, so a naive host-driven sweep can only draw
+one-frequency-per-instant shapes (a sine, a diagonal) and each `set_freq`
+re-triggers an ~800 us PLL recalibration - far too slow to light several
+frequencies inside one FFT frame.
+
+`paint` solves this on-device using the datasheet's fast-hopping recipe:
+**calibrate each column frequency once up front, save its FREQ + FSCAL
+registers, then on every hop restore those bytes with `FS_AUTOCAL = never`** so a
+retune is only the synth settling (~75 us), not a full recalibration. Interleaving
+the lit columns of a row then makes them appear simultaneous to the SDR - so a
+real horizontal stroke (e.g. the crossbar of an "A") is possible, which a
+single-carrier CLI sweep cannot do.
+
+Memory is tiny and streaming: only the calibration table lives in RAM
+(`PAINT_MAX_COLS` x 6 bytes = 768 bytes for 128 columns); the image is streamed
+one row at a time from the host, so no full bitmap is ever stored on-chip.
+
+```
+radio <iface> paint setup <fstartHz> <fstopHz> <ncols>
+      calibrate ncols evenly-spaced frequencies in [fstart, fstop] and store
+      their FREQ+FSCAL register sets. Forces OOK modulation. ncols = 1..128.
+radio <iface> paint row <dwellUs> <hexmask>
+      paint one time-row: for dwellUs, fast-hop the carrier among the lit
+      columns. hexmask is an ncols-bit array, MSB-first: column c = bit
+      (0x80 >> (c & 7)) of mask byte (c >> 3), i.e. col 0 = MSB of byte 0 =
+      lowest frequency. A blank mask = dwellUs of silence (keeps row timing).
+radio <iface> paint show        print the calibration table (FREQ + FSCAL per column)
+radio <iface> paint count       number of calibrated columns
+radio <iface> paint end         stop the carrier, restore normal auto-cal, idle
+```
+
+- A row with a **single** lit column tunes once and holds a clean CW carrier for
+  the whole dwell. A row with **several** lit columns interleaves them, holding
+  each for `PAINT_HOLD_US` (default 1200 us) so transitions stay rare enough that
+  the on/off keying sidebands do not smear the columns.
+- `paint row` is **blocking** for its `dwellUs`, like `pulses play`.
+- The carrier is keyed via GDO0 (OOK mark), so painting runs in OOK mode and
+  uses the current `pa` power.
+
+Example - paint a crossbar-style row of 8 adjacent columns (a horizontal line),
+24-column grid over 433.80-434.04 MHz, held 40 ms:
+```
+radio r0 paint setup 433800000 434040000 24
+radio r0 paint row 40000 00ff00     # cols 8..15 lit -> 8 frequencies at once
+radio r0 paint end
+```
+
+A host script that converts ASCII-art / text into a sequence of `paint setup` +
+`paint row` lines (one row per character scan-line) is the intended front end;
+each image row is just a bit mask. Tested on RP2040 hardware and verified on an
+RTL-SDR waterfall (clean CW per column, simultaneous multi-column rows, and a
+legible "A" with a real horizontal crossbar).
 
 ### profile (named work profiles, stored on LittleFS)
 
@@ -256,6 +314,7 @@ src/
   radio_params.{h,ino}    generic parameter table (name/range/get/set)
   radio_iface.{h,ino}     radio interface registry (r0)
   radio_pulses.{h,ino}    OOK pulse capture (core1) / replay / buffer
+  radio_paint.{h,ino}     spectrum painting: per-column FREQ+FSCAL table + fast carrier hopping
   radio_raw.{h,ino}       raw packet TX helper
   Monitor.ino             non-blocking RX monitor (packet + OOK/core1)
   rprofile.{h,ino}        LittleFS-backed named profiles + 'profile' command
@@ -270,8 +329,11 @@ src/
 
 Built with PlatformIO and tested on RP2040 hardware: chip detection, `info`,
 parameters, profiles, LittleFS scripts (incl. `init.scr` at boot), the
-non-blocking OOK monitor (live CLI, real frames captured on core1), and OOK
-pulse replay all work. Packet-mode (FSK) monitor and TX paths are implemented -
+non-blocking OOK monitor (live CLI, real frames captured on core1), OOK
+pulse replay, and the `paint` spectrum-painter (per-column FREQ+FSCAL
+fast-hopping, verified on an RTL-SDR: clean CW per column, simultaneous
+multi-column rows, and a legible "A" with a horizontal crossbar) all work.
+Packet-mode (FSK) monitor and TX paths are implemented -
 exercise them against your own signals. If the
 chip is not detected, `info text` shows `chip_version` (a genuine CC1101
 reports 20 / 0x14).
