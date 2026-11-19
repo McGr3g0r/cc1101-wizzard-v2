@@ -195,6 +195,11 @@ void RadioDev::armOokTx(void)
 //------------------------------------------------------------------------------------------------------------------
 bool RadioDev::waitTxReady(uint32_t timeoutUs) { return rl_wait_tx_ready(timeoutUs); }
 //------------------------------------------------------------------------------------------------------------------
+void RadioDev::paintCal(float mhz, uint8_t out6[6]) { rl_paint_cal(mhz, out6); }
+void RadioDev::paintBegin(void) { this->txen = true; this->rxen = false; rl_paint_begin(); }
+void RadioDev::paintHop(const uint8_t regs6[6])     { rl_paint_hop(regs6); }
+void RadioDev::paintEnd(void)   { this->txen = false; rl_paint_end(); }
+//------------------------------------------------------------------------------------------------------------------
 void RadioDev::sendData(uint8_t* data, int len)
 {
    if (len > 64) len = 64;

@@ -484,3 +484,63 @@ int rl_transmit_raw_bits(const uint8_t* data, size_t nbytes)
    return ret;
 }
 //------------------------------------------------------------------------------------------------------------------
+// spectrum "paint": per-frequency FREQ+FSCAL table + fast carrier hopping.
+//
+// The CC1101 is a single carrier, so an image is "painted" on an SDR waterfall
+// (X=frequency, Y=time) by hopping the carrier. Normally every retune triggers
+// a ~800us synth recalibration (FS_AUTOCAL on idle->tx), far too slow to light
+// several frequencies within one FFT frame. The datasheet's fast-hopping recipe
+// is to calibrate each frequency ONCE up front, save FSCAL3/2/1, and on each hop
+// restore those values with FS_AUTOCAL=never so the retune is only synth
+// settling (~75us). rl_paint_cal() captures the per-frequency bytes;
+// rl_paint_hop() replays them. See radio_paint.ino for the row/image logic.
+//------------------------------------------------------------------------------------------------------------------
+void rl_paint_cal(float mhz, uint8_t out6[6])
+{
+   if (!s_radio) { for (int i = 0; i < 6; i++) out6[i] = 0; return; }
+   s_radio->standby();
+   s_radio->setFrequency(mhz);          // writes FREQ2/1/0 for this column
+   rl_apply_freq_calibration(mhz);      // FSCTRL0 trim + VCO workaround (same as the normal path)
+   rl_strobe(RADIOLIB_CC1101_CMD_CAL);  // SCAL: manual synth calibration, then back to IDLE
+   uint32_t t0 = micros();
+   while (rl_marcstate() != RADIOLIB_CC1101_MARC_STATE_IDLE && (micros() - t0) < 5000) { }
+   out6[0] = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_FREQ2);
+   out6[1] = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_FREQ1);
+   out6[2] = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_FREQ0);
+   out6[3] = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_FSCAL3);
+   out6[4] = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_FSCAL2);
+   out6[5] = (uint8_t)s_radio->SPIgetRegValue(RADIOLIB_CC1101_REG_FSCAL1);
+}
+//------------------------------------------------------------------------------------------------------------------
+void rl_paint_begin(void)
+{
+   if (!s_radio) return;
+   s_radio->standby();
+   // FS_AUTOCAL = never: STX will NOT trigger a recalibration, so a hop costs
+   // only the register load + synth settling (we preload the calibrated FSCAL).
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_MCSM0, RADIOLIB_CC1101_FS_AUTOCAL_NEVER, 5, 4);
+   rl_set_tx_direct();   // async direct TX: the MCU keys the carrier via GDO0
+}
+//------------------------------------------------------------------------------------------------------------------
+void rl_paint_hop(const uint8_t regs6[6])
+{
+   if (!s_radio) return;
+   rl_strobe(RADIOLIB_CC1101_CMD_IDLE);
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_FREQ2,  regs6[0]);
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_FREQ1,  regs6[1]);
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_FREQ0,  regs6[2]);
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_FSCAL3, regs6[3]);
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_FSCAL2, regs6[4]);
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_FSCAL1, regs6[5]);
+   rl_strobe(RADIOLIB_CC1101_CMD_TX);   // re-key TX at the new frequency (no cal)
+}
+//------------------------------------------------------------------------------------------------------------------
+void rl_paint_end(void)
+{
+   if (!s_radio) return;
+   rl_strobe(RADIOLIB_CC1101_CMD_IDLE);
+   // restore the chip's normal "calibrate on idle->tx/rx" behaviour
+   s_radio->SPIsetRegValue(RADIOLIB_CC1101_REG_MCSM0, RADIOLIB_CC1101_FS_AUTOCAL_IDLE_TO_RXTX, 5, 4);
+   s_radio->standby();
+}
+//------------------------------------------------------------------------------------------------------------------

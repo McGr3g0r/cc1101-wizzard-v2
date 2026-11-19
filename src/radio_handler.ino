@@ -23,6 +23,7 @@
 //   radio <iface> send <hexstring>
 //   radio <iface> jam <ms>             (0 = until ctrl-c)
 //   radio <iface> pulses count|flush|show|grab <off> <minUs> <maxUs>|play <off> <n> [repeat] [gapUs]|add <v>...
+//   radio <iface> paint setup <fstartHz> <fstopHz> <ncols>|row <dwellUs> <hexmask>|show|count|end
 //------------------------------------------------------------------------------------------------------------------
 #include "settings.h"
 #include "CmdHandler.h"
@@ -31,6 +32,7 @@
 #include "radio_params.h"
 #include "rprofile.h"
 #include "radio_pulses.h"
+#include "radio_paint.h"
 #include "radio_raw.h"
 #include "radio_buffer.h"
 #include "rl_cc1101.h"
@@ -80,6 +82,7 @@ static void radio_usage(void)
    STDOUT.println("- <iface> scan <startKHz> <stopKHz>");
    STDOUT.println("- <iface> send <hex> | jam <ms>");
    STDOUT.println("- <iface> pulses count|flush|show|grab <off> <minUs> <maxUs>|play <off> <n> [repeat] [gapUs]|add <v>...");
+   STDOUT.println("- <iface> paint setup <fstartHz> <fstopHz> <ncols>|row <dwellUs> <hexmask>|show|count|end");
    STDOUT.println("params:");
    int n = 0;
    const radio_param_t* t = radio_params_table(&n);
@@ -289,6 +292,86 @@ static CmdStatus_e radio_jam(RadioDev* r, int nval, char** vals, CmdHandler* h)
    return OK;
 }
 //------------------------------------------------------------------------------------------------------------------
+// Parse a hex string into bytes (ignoring any non-hex separators). An odd final
+// nibble is taken as the high nibble of a trailing byte. Returns bytes written.
+static int paint_hex_to_bytes(const char* s, uint8_t* out, int maxbytes)
+{
+   int nyb = 0, nb = 0;
+   uint8_t cur = 0;
+   for (const char* p = s; *p; p++)
+   {
+      int v;
+      char ch = *p;
+      if      (ch >= '0' && ch <= '9') v = ch - '0';
+      else if (ch >= 'a' && ch <= 'f') v = ch - 'a' + 10;
+      else if (ch >= 'A' && ch <= 'F') v = ch - 'A' + 10;
+      else continue;
+      cur = (uint8_t)((cur << 4) | v);
+      if (++nyb == 2) { if (nb < maxbytes) out[nb++] = cur; nyb = 0; cur = 0; }
+   }
+   if (nyb == 1 && nb < maxbytes) out[nb++] = (uint8_t)(cur << 4);
+   return nb;
+}
+//------------------------------------------------------------------------------------------------------------------
+static CmdStatus_e radio_paint_cmd(RadioDev* r, int nval, char** vals, CmdHandler* h)
+{
+   if (nval < 1) { h->setHint("paint setup|row|show|count|end"); return NOT_ENOUGH_PARAMS; }
+   const char* a = vals[0];
+
+   if (!strcmp(a, "setup"))
+   {
+      if (nval < 4) { h->setHint("paint setup <fstartHz> <fstopHz> <ncols>"); return NOT_ENOUGH_PARAMS; }
+      long fs = atol(vals[1]);
+      long fe = atol(vals[2]);
+      int  nc = atoi(vals[3]);
+      int rc = radio_paint_setup(r, fs, fe, nc);
+      if (rc < 0) { h->setHint("bad range/ncols (1..128, fstop>fstart)"); return WRONG_PARAMS; }
+      STDOUT.print("paint setup: "); STDOUT.print(rc); STDOUT.print(" cols, ");
+      STDOUT.print((double)(fe - fs) / 1000.0 / (double)(nc > 1 ? nc - 1 : 1)); STDOUT.println(" kHz/col");
+      return OK;
+   }
+   if (!strcmp(a, "row"))
+   {
+      if (nval < 3) { h->setHint("paint row <dwellUs> <hexmask>"); return NOT_ENOUGH_PARAMS; }
+      if (radio_paint_ncols() < 1) { h->setHint("run 'paint setup' first"); return WRONG_PARAMS; }
+      uint32_t dwell = (uint32_t)strtoul(vals[1], NULL, 10);
+      uint8_t mask[(PAINT_MAX_COLS + 7) / 8];
+      int nb = paint_hex_to_bytes(vals[2], mask, (int)sizeof(mask));
+      radio_paint_row(r, dwell, mask, nb);
+      return OK;
+   }
+   if (!strcmp(a, "show"))
+   {
+      int nc = radio_paint_ncols();
+      STDOUT.print("paint cols: "); STDOUT.print(nc);
+      STDOUT.print(" ["); STDOUT.print(radio_paint_fstart());
+      STDOUT.print(".."); STDOUT.print(radio_paint_fstop()); STDOUT.println(" Hz]");
+      for (int c = 0; c < nc; c++)
+      {
+         const uint8_t* b = radio_paint_bin(c);
+         if (!b) break;
+         STDOUT.print("  c"); STDOUT.print(c); STDOUT.print(" FREQ=");
+         for (int i = 0; i < 3; i++) { if (b[i] < 16) STDOUT.print('0'); STDOUT.print(b[i], HEX); }
+         STDOUT.print(" FSCAL=");
+         for (int i = 3; i < 6; i++) { if (b[i] < 16) STDOUT.print('0'); STDOUT.print(b[i], HEX); }
+         STDOUT.println();
+      }
+      return OK;
+   }
+   if (!strcmp(a, "count"))
+   {
+      STDOUT.print("paint cols: "); STDOUT.println(radio_paint_ncols());
+      return OK;
+   }
+   if (!strcmp(a, "end") || !strcmp(a, "stop"))
+   {
+      radio_paint_stop(r);
+      return OK;
+   }
+   h->setHint("paint setup|row|show|count|end");
+   return COMMAND_NOT_FOUND;
+}
+//------------------------------------------------------------------------------------------------------------------
 static CmdStatus_e radio_pulses_cmd(int nval, char** vals, CmdHandler* h)
 {
    if (nval < 1) { h->setHint("pulses count|flush|show|grab|play|playfifo|add"); return NOT_ENOUGH_PARAMS; }
@@ -473,6 +556,7 @@ static CmdStatus_e radio_dispatch(radio_iface_t* ifc, int nsub, char** sub, CmdH
    if (!strcmp(cmd, "send"))   return radio_send(r, nsub - 1, &sub[1], h);
    if (!strcmp(cmd, "jam"))    return radio_jam(r, nsub - 1, &sub[1], h);
    if (!strcmp(cmd, "pulses")) return radio_pulses_cmd(nsub - 1, &sub[1], h);
+   if (!strcmp(cmd, "paint"))  return radio_paint_cmd(r, nsub - 1, &sub[1], h);
 
    h->setHint("unknown radio command, use 'radio help'");
    return COMMAND_NOT_FOUND;
